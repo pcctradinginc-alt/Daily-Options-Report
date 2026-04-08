@@ -1,0 +1,55 @@
+name: Daily Options Report
+
+on:
+  schedule:
+    - cron: '30 14 * * 1-5'   # Mo–Fr 14:30 UTC = 10:30 ET
+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry-run (kein Email-Versand)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Dependencies installieren
+        run: pip install -r requirements.txt
+
+      - name: Bot ausführen
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TRADIER_TOKEN:     ${{ secrets.TRADIER_TOKEN }}
+          FINNHUB_KEY:       ${{ secrets.FINNHUB_KEY }}
+          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
+          GMAIL_RECIPIENT:   ${{ secrets.GMAIL_RECIPIENT }}
+          SMTP_SENDER:       ${{ secrets.SMTP_SENDER }}
+          SMTP_PASSWORD:     ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python src/main.py --dry-run --verbose
+          else
+            python src/main.py --verbose
+          fi
+
+      - name: Report-Preview speichern (bei Dry-run)
+        if: github.event.inputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-preview
+          path: report_preview.html
+          retention-days: 7

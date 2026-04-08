@@ -1,0 +1,15 @@
+config/config.yaml
+.env
+__pycache__/
+*.py[cod]
+env/
+venv/
+.venv/
+logs/
+*.log
+report_preview.html
+market_summary.txt
+signals.txt
+.DS_Store
+.idea/
+.vscode/

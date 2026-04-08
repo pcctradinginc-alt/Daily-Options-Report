@@ -3,9 +3,10 @@ news_analyzer.py — News-Analyse (Step 1)
 
 Fixes gegenüber v1:
 - Bare excepts durch spezifische Exception-Typen ersetzt
-- Sentiment-Neutral von Negativ unterscheidbar (returned 0.0 mit fallback_used=True)
+- Sentiment-Neutral von Negativ unterscheidbar
 - Cluster-Key Kollision durch Hash-Suffix verhindert
 - Logging statt print()
+- Prompt: niedrigerer Schwellenwert, ETFs bei Makro-Events bevorzugt
 """
 
 import hashlib
@@ -96,6 +97,7 @@ MACRO_TICKER_MAP = {
     "fomc": "TLT", "treasury": "TLT", "oil": "USO", "crude": "USO", "opec": "USO",
     "gold": "GLD", "inflation": "GLD", "tariff": "SPY", "tariffs": "SPY",
     "recession": "SPY", "iran": "USO", "war": "GLD", "sanctions": "GLD",
+    "hormuz": "USO", "strait": "USO", "shipper": "USO", "shipping": "USO",
 }
 
 TICKER_PATTERN = re.compile(r'\b([A-Z]{2,5})\b')
@@ -111,6 +113,7 @@ SENTIMENT_NEGATIVE = {
     "downgrade": 0.9, "downgraded": 0.9, "underperform": 0.7, "sell": 0.7,
     "cut": 0.6, "layoffs": 0.7, "bankruptcy": 1.0, "recall": 0.7,
     "investigation": 0.7, "warning": 0.7, "guidance cut": 0.9, "recession": 0.8,
+    "plunge": 0.7, "collapse": 0.8, "crisis": 0.7, "ban": 0.5,
 }
 
 PROMPT = """Du bist ein quantitativer Options-Analyst. Analysiere News-Cluster und gib direkt handelbare Signale aus.
@@ -125,30 +128,38 @@ SCORE-FELDER:
 - EARNINGS_PENALTY: <0.5 = Earnings innerhalb 7 Tage
 
 FILTER (verwirf sofort):
-- DECAY < 0.05 oder CONFIDENCE < 1.5
+- DECAY < 0.05 oder CONFIDENCE < 1.0
 - EARNINGS_PENALTY < 0.15
-- Ticker = UNKNOWN ohne klares Makro-Event
+- Ticker = UNKNOWN ohne klares Makro-Keyword (iran/oil/fed/gold/war/hormuz)
 - ADRs: TM, TSM, NVO, BABA, ASML, SAP, BP, AZN, GSK
-- Nur 1 Artikel UND FEED_TIER_MAX >= 3
+- Nur 1 Artikel UND FEED_TIER_MAX >= 3 UND CONFIDENCE < 1.5
 
-BEHALTE:
-- Einzelaktien-Events (Earnings, Upgrade, FDA, M&A, Insider)
-- Makro-Events (Fed->TLT, Oel->USO, Gold->GLD, Tarife->SPY)
+BEHALTE IMMER:
+- Einzelaktien-Events (Earnings, Upgrade, FDA, M&A, Insider) mit CONFIDENCE >= 1.0
+- ETF-Makro-Events (Fed->TLT, Oel->USO, Gold->GLD, Tarife->SPY) mit CONFIDENCE >= 1.5
+- USO/TLT/GLD/SPY bei klarem geopolitischen Event (Iran, Hormuz, Krieg, Sanktionen, OPEC) IMMER ausgeben wenn CONFIDENCE >= 2.0
 
 RICHTUNG:
-earnings_beat/upgrade/approval -> CALL
-earnings_miss/downgrade/recall -> PUT
-fed_hold/oil_spike/war -> PUT auf TLT, CALL auf USO/GLD
-Unklare Richtung -> ueberspringen
+earnings_beat/upgrade/approval/insider_buy -> CALL
+earnings_miss/downgrade/recall/bankruptcy -> PUT
+fed_cut/macro_positiv -> CALL auf TLT oder SPY
+fed_hold/oil_spike/iran/hormuz/krieg/sanktionen -> PUT auf TLT, CALL auf USO/GLD
+Unklare Richtung ohne ETF-Bezug -> ueberspringen
+
+DTE nach Horizont:
+T1 (kurzfristig 0-5 Tage): 21DTE
+T2 (mittelfristig 2-8 Wochen): 45DTE
+T3 (Makro/geopolitisch): 45DTE
 
 OUTPUT — NUR DIESE EINE ZEILE:
 Format: TICKER_SIGNALS:TICKER:RICHTUNG:SCORE:HORIZONT:DTE,...
-Beispiel: TICKER_SIGNALS:XOM:CALL:HIGH:T1:21DTE,TLT:PUT:MED:T1:21DTE
+Beispiel: TICKER_SIGNALS:USO:CALL:HIGH:T3:45DTE,TLT:PUT:MED:T3:45DTE
 
 Regeln:
 - Max 8 Ticker | Sortiert HIGH->MED->LOW
-- SCORE: HIGH (CONFIDENCE>=5) | MED (2-4.9) | LOW (<2)
-- Bei 0 validen Signalen: TICKER_SIGNALS:NONE"""
+- SCORE: HIGH (CONFIDENCE>=4) | MED (1.5-3.9) | LOW (1.0-1.4)
+- Bei 0 validen Signalen nach allen Pruefungen: TICKER_SIGNALS:NONE
+- ETFs (TLT/USO/GLD/SPY) bei Makro-Events ausdruecklich bevorzugen"""
 
 
 # ══════════════════════════════════════════════════════════
@@ -182,17 +193,12 @@ def earnings_proximity_penalty(ticker: str, earnings_map: dict) -> float:
     return round(max(0.05, sigmoid), 4)
 
 def calculate_sentiment(title: str, summary: str = "") -> float:
-    """
-    Gibt Sentiment-Score zurück.
-    Fix: 0.0 bedeutet explizit 'neutral' (keine Treffer),
-    nicht 'ausgeglichen positiv/negativ'.
-    """
-    text     = (title + " " + summary).lower()
-    pos      = sum(w for p, w in SENTIMENT_POSITIVE.items() if p in text)
-    neg      = sum(w for p, w in SENTIMENT_NEGATIVE.items() if p in text)
-    total    = pos + neg
+    text  = (title + " " + summary).lower()
+    pos   = sum(w for p, w in SENTIMENT_POSITIVE.items() if p in text)
+    neg   = sum(w for p, w in SENTIMENT_NEGATIVE.items() if p in text)
+    total = pos + neg
     if total == 0:
-        return 0.0  # neutral — keine Sentiment-Keywords gefunden
+        return 0.0
     return max(-1.0, min(1.0, round((pos - neg) / (total + 0.001), 2)))
 
 def get_market_context() -> tuple:
@@ -222,12 +228,11 @@ def parse_pub_date(date_str: str) -> datetime:
 
 # ══════════════════════════════════════════════════════════
 # RSS FETCH
-# Fix: spezifische Exceptions statt bare except
 # ══════════════════════════════════════════════════════════
 
 def fetch_one_feed(feed: dict) -> list:
     try:
-        r      = requests.get(feed["url"], timeout=4, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(feed["url"], timeout=4, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         root   = ET.fromstring(r.content)
         result = []
@@ -246,7 +251,8 @@ def fetch_one_feed(feed: dict) -> list:
                 if kw in text_lower:
                     kw_score += weight
                     detected.append(kw)
-            tickers = [t for t in TICKER_PATTERN.findall(title + " " + summary) if t in KNOWN_TICKERS]
+            tickers = [t for t in TICKER_PATTERN.findall(title + " " + summary)
+                       if t in KNOWN_TICKERS]
             for alias, sym in TICKER_ALIASES.items():
                 if alias.lower() in (title + " " + summary).lower() and sym not in tickers:
                     tickers.append(sym)
@@ -269,10 +275,10 @@ def fetch_one_feed(feed: dict) -> list:
         logger.debug("Feed %s nicht erreichbar: %s", feed["name"], e)
         return []
     except ET.ParseError as e:
-        logger.debug("Feed %s: XML-Fehler: %s", feed["name"], e)
+        logger.debug("Feed %s XML-Fehler: %s", feed["name"], e)
         return []
     except (KeyError, ValueError) as e:
-        logger.debug("Feed %s: Daten-Fehler: %s", feed["name"], e)
+        logger.debug("Feed %s Daten-Fehler: %s", feed["name"], e)
         return []
 
 
@@ -322,15 +328,8 @@ def build_earnings_map(finnhub_key: str) -> dict:
 
 
 def cluster_articles(articles: list, earnings_map: dict) -> list:
-    """
-    Fix: Cluster-Key enthält Hash-Suffix um Kollisionen zu vermeiden.
-    Zwei verschiedene Artikel mit gleichem first-ticker + first-keyword
-    werden nicht mehr fälschlicherweise zusammengeführt wenn sie
-    verschiedene Ereignisse beschreiben.
-    """
     clusters = {}
     for art in articles:
-        # Key-Konstruktion mit Hash-Suffix gegen Kollisionen
         if art["tickers"] and art["keywords"]:
             base_key = art["tickers"][0] + "_" + art["keywords"][0]
         elif art["tickers"]:
@@ -340,8 +339,6 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
         else:
             base_key = art["hash"]
 
-        # Gleicher Ticker+Event → gleicher Cluster (korrekt)
-        # Verschiedene Headlines → verschiedene Cluster durch Hash
         key = base_key
 
         if key not in clusters:
@@ -441,10 +438,10 @@ def run_claude(cluster_text: str, market_time: str, market_status: str,
                     "content-type":      "application/json",
                 },
                 json={
-                    "model":    "claude-sonnet-4-6",
+                    "model":      "claude-sonnet-4-6",
                     "max_tokens": 200,
-                    "system":   prompt,
-                    "messages": [{"role": "user", "content": "Cluster:\n" + cluster_text}],
+                    "system":     prompt,
+                    "messages":   [{"role": "user", "content": "Cluster:\n" + cluster_text}],
                 },
                 timeout=22,
             )

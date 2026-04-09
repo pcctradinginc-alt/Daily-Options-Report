@@ -31,11 +31,10 @@ from rules import parse_ticker_signals, RULES
 
 
 def setup_logging(verbose: bool) -> None:
-    level  = logging.DEBUG if verbose else logging.INFO
-    fmt    = "%(asctime)s %(levelname)-8s %(name)s — %(message)s"
+    level   = logging.DEBUG if verbose else logging.INFO
+    fmt     = "%(asctime)s %(levelname)-8s %(name)s — %(message)s"
     datefmt = "%H:%M:%S"
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt)
-    # Externe Libraries ruhig stellen
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
 
@@ -93,10 +92,14 @@ def main() -> int:
     )
     logger.info("  Signal: %s  (%.1fs)", ticker_signals, time.monotonic() - t1)
 
-    # Kein Signal → No-Trade Email
+    # VIX immer holen — wird auch für No-Trade Email benötigt
+    vix_value = get_vix()
+    logger.info("  VIX: %s", vix_value)
+
+    # Kein Signal → No-Trade Email mit VIX + Top-Clustern
     if ticker_signals in ("TICKER_SIGNALS:NONE", ""):
         logger.info("Keine validen Signale heute")
-        html    = _no_trade_html(today)
+        html    = _no_trade_html(today, vix_value, market_status, clusters[:3])
         subject = "⏸️ Kein Trade heute – " + today
         _send_or_save(html, subject, cfg, args.dry_run)
         logger.info("Fertig in %.1fs", time.monotonic() - t_start)
@@ -108,7 +111,6 @@ def main() -> int:
     logger.info("[2/3] Marktdaten...")
     t2 = time.monotonic()
 
-    # Robuster Parser via rules.py (ersetzt fragilen Regex-Split)
     parsed_signals = parse_ticker_signals(ticker_signals)
 
     if not parsed_signals:
@@ -126,9 +128,7 @@ def main() -> int:
     date_end    = (datetime.now() + timedelta(days=10)).strftime("%Y-%m-%d")
 
     with ThreadPoolExecutor(max_workers=2) as ex:
-        vix_fut       = ex.submit(get_vix)
         earnings_fut  = ex.submit(get_earnings, date_today, date_end, finnhub_key)
-        vix_value     = vix_fut.result(timeout=12)
         earnings_list = earnings_fut.result(timeout=12)
 
     logger.info("  VIX: %s | %d Ticker", vix_value, len(tickers))
@@ -196,30 +196,110 @@ def _send_or_save(html: str, subject: str, cfg: dict, dry_run: bool) -> None:
         send_email(subject, html, cfg)
 
 
-def _no_trade_html(today: str) -> str:
+def _no_trade_html(today: str, vix=None, market_status: str = "",
+                   clusters: list = None) -> str:
+    vix_str    = str(vix) if vix and vix != "n/v" else "n/v"
+    status_str = market_status or "unbekannt"
+    clusters   = clusters or []
+
+    cluster_rows = ""
+    for c in clusters:
+        conf      = c.get("confidence_score", 0)
+        tick      = c.get("ticker", "?")
+        head      = c.get("headline_repr", "")[:60]
+        sent      = c.get("sentiment_score", 0)
+        sent_icon = "📈" if sent > 0.1 else ("📉" if sent < -0.1 else "➖")
+        cluster_rows += (
+            f'<tr>'
+            f'<td style="padding:6px 8px;font-size:12px;font-weight:600;color:#1d1d1f;">{tick}</td>'
+            f'<td style="padding:6px 8px;font-size:12px;color:#86868b;text-align:center;">{conf:.2f}</td>'
+            f'<td style="padding:6px 8px;font-size:12px;color:#86868b;text-align:center;">{sent_icon}</td>'
+            f'<td style="padding:6px 8px;font-size:12px;color:#86868b;">{head}</td>'
+            f'</tr>'
+        )
+
+    cluster_section = ""
+    if cluster_rows:
+        cluster_section = (
+            '<div style="margin-top:20px;text-align:left;">'
+            '<p style="font-size:11px;font-weight:600;color:#86868b;'
+            'text-transform:uppercase;letter-spacing:0.06em;margin:0 0 8px 0;">'
+            'Top Cluster heute</p>'
+            '<table style="width:100%;border-collapse:collapse;">'
+            '<tr style="border-bottom:2px solid #e5e5ea;">'
+            '<th style="padding:4px 8px;font-size:10px;color:#86868b;text-align:left;">Ticker</th>'
+            '<th style="padding:4px 8px;font-size:10px;color:#86868b;">Conf</th>'
+            '<th style="padding:4px 8px;font-size:10px;color:#86868b;">Sent</th>'
+            '<th style="padding:4px 8px;font-size:10px;color:#86868b;text-align:left;">Headline</th>'
+            '</tr>'
+            + cluster_rows +
+            '</table></div>'
+        )
+
     return (
-        '<html><body style="font-family:-apple-system,sans-serif;background:#f5f5f7;'
-        'padding:40px;text-align:center;">'
+        '<html><head><meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1.0"></head>'
+        '<body style="margin:0;padding:0;background:#f5f5f7;'
+        'font-family:-apple-system,BlinkMacSystemFont,Helvetica Neue,Arial,sans-serif;">'
+        '<div style="max-width:520px;margin:0 auto;padding:32px 16px;">'
         '<div style="background:white;border-radius:18px;padding:32px;'
-        'max-width:400px;margin:0 auto;">'
-        '<div style="font-size:48px;margin-bottom:16px;">⏸️</div>'
-        '<h2 style="color:#1d1d1f;margin:0 0 12px 0;">Heute kein Trade</h2>'
-        '<p style="color:#86868b;font-size:14px;line-height:1.6;">' + today +
-        ' — Die News-Analyse hat keine validen Signale gefunden.<br>'
+        'box-shadow:0 2px 12px rgba(0,0,0,0.07);">'
+
+        # Header
+        '<div style="text-align:center;margin-bottom:24px;">'
+        '<div style="font-size:48px;margin-bottom:12px;">⏸️</div>'
+        '<h2 style="color:#1d1d1f;margin:0 0 6px 0;font-size:22px;font-weight:700;">'
+        'Heute kein Trade</h2>'
+        f'<p style="color:#86868b;font-size:13px;margin:0;">{today}</p>'
+        '</div>'
+
+        # Statuszeilen
+        '<div style="border-top:1px solid #e5e5ea;padding-top:4px;">'
+
+        '<div style="display:flex;justify-content:space-between;align-items:center;'
+        'padding:10px 0;border-bottom:1px solid #e5e5ea;">'
+        '<span style="font-size:14px;color:#86868b;">VIX</span>'
+        f'<span style="font-size:14px;font-weight:600;color:#1d1d1f;">{vix_str}</span>'
+        '</div>'
+
+        '<div style="display:flex;justify-content:space-between;align-items:center;'
+        'padding:10px 0;border-bottom:1px solid #e5e5ea;">'
+        '<span style="font-size:14px;color:#86868b;">Markt</span>'
+        f'<span style="font-size:14px;font-weight:600;color:#1d1d1f;">{status_str}</span>'
+        '</div>'
+
+        '<div style="display:flex;justify-content:space-between;align-items:center;'
+        'padding:10px 0;">'
+        '<span style="font-size:14px;color:#86868b;">Grund</span>'
+        '<span style="font-size:14px;color:#1d1d1f;">Kein valides Signal</span>'
+        '</div>'
+
+        '</div>'
+
+        # Top Cluster
+        + cluster_section +
+
+        # Footer
+        '<div style="margin-top:20px;background:#f5f5f7;border-radius:12px;'
+        'padding:14px;text-align:center;">'
+        '<p style="margin:0;font-size:12px;color:#86868b;">'
         'Morgen läuft die Analyse erneut automatisch.</p>'
-        '</div></body></html>'
+        '</div>'
+
+        '</div></div></body></html>'
     )
 
 
 def _error_html(error: str, today: str) -> str:
     return (
-        '<html><body style="font-family:-apple-system,sans-serif;background:#f5f5f7;'
+        '<html><head><meta charset="UTF-8"></head>'
+        '<body style="font-family:-apple-system,sans-serif;background:#f5f5f7;'
         'padding:40px;text-align:center;">'
         '<div style="background:white;border-radius:18px;padding:32px;'
         'max-width:400px;margin:0 auto;">'
         '<div style="font-size:40px;margin-bottom:16px;">⚠️</div>'
         '<h2 style="color:#1d1d1f;margin:0 0 8px 0;">Fehler</h2>'
-        '<p style="color:#86868b;font-size:14px;">' + error + '</p>'
+        f'<p style="color:#86868b;font-size:14px;">{error}</p>'
         '</div></body></html>'
     )
 

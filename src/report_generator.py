@@ -5,6 +5,8 @@ Fixes gegenüber v1:
 - JSON end=0 Ambiguität aufgelöst: explizite found/not-found Logik
 - Bare excepts durch spezifische Exceptions ersetzt
 - Logging statt print()
+- VIX-Regeln und Einsatz-Berechnung Code-seitig via rules.py (Claude-Halluzinationen abgefangen)
+- Claude-Output wird gegen Schema validiert vor HTML-Generierung
 """
 
 import json
@@ -17,6 +19,8 @@ from email.mime.text import MIMEText
 
 import requests
 from requests.exceptions import RequestException, Timeout
+
+from rules import apply_vix_rules, validate_claude_output, RULES
 
 logger = logging.getLogger(__name__)
 
@@ -187,18 +191,33 @@ def call_claude(summary: str, api_key: str) -> dict:
         ("beide_kombiniert", lambda f: json.loads(repair_json_quotes(close_fragment(f)))),
     ]
     last_error = None
+    result     = None
     for name, parser in parsers:
         try:
             result = parser(fragment)
             if name != "direkt":
                 logger.info("JSON repariert mit Methode: %s", name)
-            return result
+            break
         except json.JSONDecodeError as e:
             last_error = e
             logger.debug("Parse-Versuch '%s' fehlgeschlagen: %s", name, e)
 
-    raise ValueError("JSON Parse Fehler nach 4 Versuchen: " + str(last_error) +
-                     " | Raw: " + text[:300])
+    if result is None:
+        raise ValueError("JSON Parse Fehler nach 4 Versuchen: " + str(last_error) +
+                         " | Raw: " + text[:300])
+
+    # Schema-Validierung (faengt Claude-Halluzinationen ab)
+    is_valid, errors = validate_claude_output(result)
+    if not is_valid:
+        logger.warning("Claude-Output Schema-Fehler (werden korrigiert): %s", errors)
+
+    # VIX-Regeln Code-seitig durchsetzen (ueberschreibt Claude immer)
+    vix_raw = result.get("vix", "0")
+    result  = apply_vix_rules(vix_raw, result)
+    logger.info("VIX=%s Einsatz=%s no_trade=%s",
+                vix_raw, result.get("einsatz","?"), result.get("no_trade"))
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════

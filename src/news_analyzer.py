@@ -4,6 +4,7 @@ news_analyzer.py — News-Analyse (Step 1)
 Änderungen v3:
 - WSJ Feed (Tier 1, Credibility 0.89) hinzugefügt
 - Nasdaq Feed (Tier 2, Credibility 0.75) hinzugefügt
+- BBC_Business + BBC_Economy (Tier 2) hinzugefügt
 - Benzinga_Breaking Credibility 0.51 → 0.45
 - DECAY_LAMBDA 0.15 → 0.18 (schnelleres Altern)
 - VELOCITY_WINDOW_MIN 60 → 45 min
@@ -43,6 +44,7 @@ CREDIBILITY = {
     "Benzinga_Ratings": 0.74, "Benzinga_Insider": 0.73, "Benzinga_Options": 0.68,
     "Nasdaq_Markets":   0.75,
     "MarketWatch":      0.70,
+    "BBC_Business":     0.87, "BBC_Economy":     0.86,
     "Benzinga_Markets": 0.60, "Benzinga_Breaking": 0.45,
 }
 CREDIBILITY_DEFAULT = 0.65
@@ -61,6 +63,8 @@ FEEDS = [
     {"name": "CNBC_WorldNews",    "tier": 2, "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html"},
     {"name": "MarketWatch",       "tier": 2, "url": "https://feeds.marketwatch.com/marketwatch/topstories/"},
     {"name": "Nasdaq_Markets",    "tier": 2, "url": "https://www.nasdaq.com/feed/rssoutbound?category=Markets"},
+    {"name": "BBC_Business",      "tier": 2, "url": "https://feeds.bbci.co.uk/news/business/rss.xml"},
+    {"name": "BBC_Economy",       "tier": 2, "url": "https://feeds.bbci.co.uk/news/business/economy/rss.xml"},
     {"name": "Benzinga_Options",  "tier": 2, "url": "https://news.google.com/rss/search?q=site:benzinga.com/markets/options&hl=en-US&gl=US&ceid=US:en"},
     {"name": "Benzinga_Markets",  "tier": 3, "url": "https://news.google.com/rss/search?q=site:benzinga.com/markets&hl=en-US&gl=US&ceid=US:en"},
     {"name": "Benzinga_Breaking", "tier": 3, "url": "https://news.google.com/rss/search?q=site:benzinga.com/news&hl=en-US&gl=US&ceid=US:en"},
@@ -386,7 +390,7 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
             clusters[key] = {
                 "ticker":       art["tickers"][0] if art["tickers"] else fallback,
                 "event_type":   art["keywords"][0] if art["keywords"] else "general",
-                "articles":     [], "sources":      [],
+                "articles":     [], "sources": [],
                 "min_age":      art["age_min"],
                 "kw_score_sum": 0,
                 "top_headline": art["title"],

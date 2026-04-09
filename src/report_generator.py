@@ -5,8 +5,10 @@ Fixes gegenüber v1:
 - JSON end=0 Ambiguität aufgelöst: explizite found/not-found Logik
 - Bare excepts durch spezifische Exceptions ersetzt
 - Logging statt print()
-- VIX-Regeln und Einsatz-Berechnung Code-seitig via rules.py (Claude-Halluzinationen abgefangen)
+- VIX-Regeln und Einsatz-Berechnung Code-seitig via rules.py
 - Claude-Output wird gegen Schema validiert vor HTML-Generierung
+- _compress_summary(): Earnings-Liste auf 10 Ticker gekürzt
+- max_tokens 1100 → 1500, timeout 25 → 30s
 """
 
 import json
@@ -57,7 +59,6 @@ JSON-Schema (valides JSON, kein Text davor/danach):
 
 # ══════════════════════════════════════════════════════════
 # JSON REPAIR
-# Fix R7: end=0 Ambiguität aufgelöst
 # ══════════════════════════════════════════════════════════
 
 def repair_json_quotes(text: str) -> str:
@@ -118,21 +119,41 @@ def close_fragment(frag: str) -> str:
 
 def extract_json_fragment(text: str) -> str:
     """
-    Fix R7: Explizite Suche nach JSON-Grenzen.
+    Explizite Suche nach JSON-Grenzen.
     Ambiguität von rfind("}") == -1 → +1 = 0 aufgelöst.
     """
     start = text.find("{")
     if start == -1:
         raise ValueError("Kein öffnendes { im Claude-Response")
-
-    # Suche schließendes } von rechts
     end = text.rfind("}")
     if end == -1:
-        # Kein schließendes } gefunden → Fragment reparieren
         logger.debug("Kein schließendes } — close_fragment wird angewendet")
-        return text[start:]  # Fragment ohne Ende
+        return text[start:]
+    return text[start:end + 1]
 
-    return text[start:end + 1]  # Vollständiges JSON
+
+# ══════════════════════════════════════════════════════════
+# SUMMARY KOMPRIMIERUNG
+# ══════════════════════════════════════════════════════════
+
+def _compress_summary(summary: str) -> str:
+    """
+    Kürzt den Market Summary für den Claude-Call.
+    Earnings-Liste kann 200+ Ticker enthalten → auf max 10 kürzen.
+    Verhindert JSON-Abschneiden durch token-limit.
+    """
+    lines = summary.splitlines()
+    result = []
+    for line in lines:
+        if line.startswith("EARNINGS NAECHSTE"):
+            parts = line.split(": ", 1)
+            if len(parts) == 2:
+                tickers = [t.strip() for t in parts[1].split(",")][:10]
+                line = parts[0] + ": " + ", ".join(tickers) + (" ..." if len(tickers) == 10 else "")
+        result.append(line)
+        if "SENTIMENT-FALLBACK" in line:
+            break
+    return "\n".join(result)[:2000]
 
 
 # ══════════════════════════════════════════════════════════
@@ -140,15 +161,7 @@ def extract_json_fragment(text: str) -> str:
 # ══════════════════════════════════════════════════════════
 
 def call_claude(summary: str, api_key: str) -> dict:
-    # Summary kürzen
-    if len(summary) > 1500:
-        lines, kept = summary.splitlines(), []
-        for line in lines:
-            kept.append(line)
-            if "SENTIMENT-FALLBACK" in line:
-                break
-        summary = "\n".join(kept)
-    summary = summary[:1400]
+    summary = _compress_summary(summary)
 
     try:
         r = requests.post(
@@ -160,11 +173,11 @@ def call_claude(summary: str, api_key: str) -> dict:
             },
             json={
                 "model":      "claude-sonnet-4-6",
-                "max_tokens": 1100,
+                "max_tokens": 1500,
                 "system":     PROMPT,
                 "messages":   [{"role": "user", "content": "Marktdaten:\n" + summary}],
             },
-            timeout=25,
+            timeout=30,
         )
         r.raise_for_status()
     except (RequestException, Timeout) as e:
@@ -206,12 +219,12 @@ def call_claude(summary: str, api_key: str) -> dict:
         raise ValueError("JSON Parse Fehler nach 4 Versuchen: " + str(last_error) +
                          " | Raw: " + text[:300])
 
-    # Schema-Validierung (faengt Claude-Halluzinationen ab)
+    # Schema-Validierung
     is_valid, errors = validate_claude_output(result)
     if not is_valid:
         logger.warning("Claude-Output Schema-Fehler (werden korrigiert): %s", errors)
 
-    # VIX-Regeln Code-seitig durchsetzen (ueberschreibt Claude immer)
+    # VIX-Regeln Code-seitig durchsetzen (überschreibt Claude immer)
     vix_raw = result.get("vix", "0")
     result  = apply_vix_rules(vix_raw, result)
     logger.info("VIX=%s Einsatz=%s no_trade=%s",
@@ -419,7 +432,8 @@ def build_html(d: dict, today: str) -> str:
             f'<strong style="color:{status_col};">{status}</strong>'
             f'</span></div></div>'
             f'{trade_card}{vix_warning}{exit_card}{markt_card}{tabelle_card}'
-            f'<div style="text-align:center;padding:20px 0;border-top:1px solid {BD};margin-top:8px;">'
+            f'<div style="text-align:center;padding:20px 0;'
+            f'border-top:1px solid {BD};margin-top:8px;">'
             f'<p style="margin:0;font-size:12px;color:{GR};">VIX ✓ · Earnings ✓ · Greeks ✓</p>'
             f'</div></div></body></html>')
 

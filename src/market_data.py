@@ -816,6 +816,10 @@ def process_ticker(ticker, direction, earnings_list, cfg,
         score = round(max(0.0, min(100.0,
             score + sector_result.score_adjustment + sentiment_reaction.get("sentiment_price_score_adjustment", 0.0)
         )), 2)
+        # raw_signal_score bleibt fuer Event-Study erhalten. Harte Gates duerfen
+        # den finalen Trade-Score auf 0 setzen, aber sie duerfen den Ursprungsscore
+        # nicht ueberschreiben.
+        raw_signal_score = score
         score_reason = score_reason + "; sector=" + sector_result.severity + "; sent_price=" + sentiment_reaction.get("sentiment_price_label", "neutral")
 
         # Harte Snapshot-Konsistenz: Options-EV wird nur berechnet, wenn auch der
@@ -874,8 +878,8 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             logger.info("%s: No-Trade-Gate: %s", ticker, final_reason)
 
         logger.info(
-            "%s: price=%.2f score=%.1f data_ok=%s liquid=%s ev_ok=%s ev=%s src=%s dte=%d",
-            ticker, price, score, data_ok, is_liquid, ev_ok, options_data.get("ev_pct"), quote_src, target_dte
+            "%s: price=%.2f score=%.1f raw=%.1f data_ok=%s liquid=%s ev_ok=%s ev=%s src=%s dte=%d",
+            ticker, price, score, raw_signal_score, data_ok, is_liquid, ev_ok, options_data.get("ev_pct"), quote_src, target_dte
         )
 
         return {
@@ -916,6 +920,8 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             "sentiment_rank_only": True,
             "sent_fallback": sent_fallback,
             "earnings_soon": earnings_soon,
+            "raw_signal_score": raw_signal_score,
+            "gate_adjusted_score": score,
             "score": score,
             "_score_reason": score_reason,
             "_data_quality_ok": data_ok,
@@ -978,7 +984,7 @@ def build_summary(ranked, vix_value, ticker_directions,
 
     s += "\nMARKTDATEN (sortiert nach Score):\n"
     s += (f"{'Ticker':<6} | {'Kurs':>7} | {'Δ%':>6} | {'MA50':>7} | "
-          f"{'Trend':<14} | {'RelVol':>7} | {'News':>5} | {'Score':>6} | {'Gate':<4}\n" + "-" * 118 + "\n")
+          f"{'Trend':<14} | {'RelVol':>7} | {'News':>5} | {'Raw':>6} | {'Score':>6} | {'Gate':<4}\n" + "-" * 128 + "\n")
 
     for d in ranked:
         if d.get("etf_no_data"):
@@ -996,10 +1002,11 @@ def build_summary(ranked, vix_value, ticker_directions,
         )
         gate_flag = "OK" if gate_ok else "FAIL"
 
+        raw_score = d.get("raw_signal_score", d.get("score", 0.0))
         s += (f"{d['ticker']:<6} | {kurs_str} | {d['change_pct']:>6.2f}% | "
               f"{str(d.get('ma50','n/v')):>7} | {d.get('trend_status','n/v'):<14} | "
               f"{str(d['rel_vol']):>6}{'🔥' if d.get('unusual') else ''} | "
-              f"{news_flag:>5} | {d['score']:>6.2f} | {gate_flag:<4}\n")
+              f"{news_flag:>5} | {raw_score:>6.2f} | {d['score']:>6.2f} | {gate_flag:<4}\n")
 
         if d.get("_no_trade_reason"):
             s += "  ⛔ NO_TRADE_REASON: " + d["_no_trade_reason"] + "\n"
@@ -1034,9 +1041,21 @@ def build_summary(ranked, vix_value, ticker_directions,
                   " | EV_OK=" + str(opt.get("ev_ok", False)) +
                   " | EARN_IV_OK=" + str(opt.get("earnings_iv_ok", True)) + "\n")
 
-    s += "\nSENTIMENT-FALLBACK: " + (
-        ", ".join(d["ticker"] for d in ranked if d.get("sent_fallback")) or "keiner"
-    )
+    sources = []
+    keyword_fallback = []
+    market_fallback = []
+    for d in ranked:
+        news_src = d.get("news_sentiment_source")
+        if news_src:
+            sources.append(d["ticker"] + "=" + str(news_src))
+            if news_src == "keyword":
+                keyword_fallback.append(d["ticker"])
+        if d.get("sent_fallback"):
+            market_fallback.append(d["ticker"])
+
+    s += "\nSENTIMENT-QUELLEN: " + (", ".join(sources) or "n/v")
+    s += "\nKEYWORD-FALLBACK NEWS: " + (", ".join(keyword_fallback) or "keiner")
+    s += "\nMARKTDATEN-SENTIMENT-FALLBACK: " + (", ".join(market_fallback) or "keiner")
     return s
 
 

@@ -32,7 +32,7 @@ REGELN:
 - VIX 20-24.99 -> einsatz: 150
 - VIX < 20 -> einsatz: 250
 - Ausschluss: Score <50 | change_pct <0 | unter MA50 | Spread >2% | OI <5000
-- stop_loss_eur = 40% von einsatz
+- stop_loss_eur = 30% von einsatz
 - kontrakte = round(einsatz / (midpoint * 100)) wenn midpoint bekannt
 - bid/ask aus Marktdaten uebernehmen
 
@@ -284,7 +284,7 @@ def build_html(d: dict, today: str) -> str:
             row("Einstieg (Midpoint)", d.get("midpoint","n/v")) +
             row("Kontrakte",           str(d.get("kontrakte","n/v"))) +
             row("Einsatz",             str(einsatz) + "€") +
-            row("Stop-Loss",           "–40% = max. " + str(stop_loss) + "€", R) +
+            row("Stop-Loss",           "–30% = max. " + str(stop_loss) + "€", R) +
             row("Take-Profit 1",       "+50% → 50% verkaufen", G) +
             row("Take-Profit 2",       "Rest mit –10% Stop", G) +
             row("Unusual Activity",    "JA 🔥" if d.get("unusual") else "nein",
@@ -331,7 +331,7 @@ def build_html(d: dict, today: str) -> str:
     # ── Exit Plan mit konkreten USD-Preisen ───────────────
     exit_card = ""
     if not no_trade:
-        stop_pct = 0.40
+        stop_pct = 0.30
         tp1_pct  = 0.50
         stop_e   = round(d.get("einsatz", 150) * stop_pct)
 

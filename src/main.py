@@ -190,11 +190,16 @@ def main() -> int:
     logger.info("  Marktdaten fertig  (%.1fs)", time.monotonic() - t2)
 
     if not any(d.get("score", 0) >= RULES.min_score and d.get("options", {}).get("ev_ok") for d in ranked):
-        logger.info("Kein Ticker besteht Score+Liquidität+EV-Filter")
+        logger.info("Kein Ticker besteht Datenqualität+Score+Liquidität+EV+Earnings-IV-Gates")
+        reject_reasons = []
+        for d in ranked[:5]:
+            reason = d.get("_no_trade_reason") or d.get("_score_reason") or "Gate nicht bestanden"
+            reject_reasons.append(f"{d.get('ticker','?')}: {reason}")
+        no_trade_reason = " | ".join(reject_reasons)[:500] or "Kein Kandidat mit positivem Options EV"
         data = {
             "datum": today, "vix": str(vix_value), "regime": "TRENDING",
             "regime_farbe": "gelb", "no_trade": True,
-            "no_trade_grund": "Kein Kandidat mit positivem Options EV",
+            "no_trade_grund": no_trade_reason,
             "ticker_tabelle": [],
         }
         log_final_decision(run_id, data)
@@ -265,19 +270,11 @@ def _run_sec_check(market_data: list) -> None:
             d["sec_reason"]     = sec.get("reason", "")
             d["sec_confidence"] = sec.get("confidence", 0.0)
 
-            # SEC bearish → Score halbieren
-            if sec.get("bearish") and d["score"] > 0:
-                old_score  = d["score"]
-                d["score"] = round(d["score"] * 0.5, 2)
-                logger.info("SEC bearish %s: Score %.1f → %.1f | %s",
-                            ticker, old_score, d["score"], sec.get("reason",""))
-
-            # SEC Insider-Kauf → Score +10
-            if sec.get("insider_buy") and d["score"] > 0:
-                old_score  = d["score"]
-                d["score"] = round(min(100.0, d["score"] + 10.0), 2)
-                logger.info("SEC Insider-Kauf %s: Score %.1f → %.1f | %s",
-                            ticker, old_score, d["score"], sec.get("reason",""))
+            # v7: SEC verändert den Score nicht mehr direkt.
+            # Es wird als Feature journalisiert und im Report erklärt. Score-Gewichte werden später empirisch geprüft.
+            if sec.get("bearish") or sec.get("insider_buy"):
+                logger.info("SEC Feature %s: bearish=%s insider_buy=%s | %s",
+                            ticker, sec.get("bearish"), sec.get("insider_buy"), sec.get("reason", ""))
 
     except ImportError:
         logger.debug("sec_check nicht installiert — SEC übersprungen")

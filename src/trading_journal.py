@@ -121,6 +121,16 @@ def init_db(con: sqlite3.Connection) -> None:
             sentiment_price_score_adjustment REAL,
             data_quality_score REAL,
             price_spike_pct REAL,
+            iv_rank REAL,
+            iv_percentile REAL,
+            iv_history_count INTEGER,
+            iv_rank_reason TEXT,
+            iv_cold_start INTEGER,
+            sector_vs_market_pct REAL,
+            sector_momentum_confirmation TEXT,
+            time_stop_hours INTEGER,
+            time_stop_required_move_pct REAL,
+            time_stop_rule TEXT,
             selected_trade INTEGER DEFAULT 0,
             FOREIGN KEY(run_id) REFERENCES runs(run_id)
         );
@@ -190,6 +200,12 @@ def init_db(con: sqlite3.Connection) -> None:
         "iv_percentile": "REAL",
         "iv_history_count": "INTEGER",
         "iv_rank_reason": "TEXT",
+        "iv_cold_start": "INTEGER",
+        "sector_vs_market_pct": "REAL",
+        "sector_momentum_confirmation": "TEXT",
+        "time_stop_hours": "INTEGER",
+        "time_stop_required_move_pct": "REAL",
+        "time_stop_rule": "TEXT",
     })
     con.commit()
 
@@ -274,6 +290,8 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
         "sector_filter_ok", "sector_filter_reason", "sentiment_price_label",
         "sentiment_price_score_adjustment", "data_quality_score", "price_spike_pct",
         "iv_rank", "iv_percentile", "iv_history_count", "iv_rank_reason",
+        "iv_cold_start", "sector_vs_market_pct", "sector_momentum_confirmation",
+        "time_stop_hours", "time_stop_required_move_pct", "time_stop_rule",
     ]
     placeholders = ", ".join(["?"] * len(columns))
     sql = f"INSERT INTO signals({', '.join(columns)}) VALUES ({placeholders})"
@@ -309,7 +327,10 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
                 d.get("sentiment_price_label", ""), d.get("sentiment_price_score_adjustment"),
                 d.get("data_quality_score"), d.get("price_spike_pct"),
                 opt.get("iv_rank"), opt.get("iv_percentile"), opt.get("iv_history_count"),
-                opt.get("iv_rank_reason", ""),
+                opt.get("iv_rank_reason", ""), 1 if opt.get("iv_cold_start") else 0,
+                d.get("sector_vs_market_pct"), d.get("sector_momentum_confirmation", ""),
+                opt.get("time_stop_hours"), opt.get("time_stop_required_move_pct"),
+                opt.get("time_stop_rule", ""),
             ]
             cur = con.execute(sql, values)
             signal_id = int(cur.lastrowid)

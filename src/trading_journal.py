@@ -140,8 +140,27 @@ def init_db(con: sqlite3.Connection) -> None:
             UNIQUE(signal_id, horizon)
         );
 
+        CREATE TABLE IF NOT EXISTS option_iv_history (
+            iv_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            run_id INTEGER,
+            signal_id INTEGER,
+            ticker TEXT NOT NULL,
+            direction TEXT,
+            expiration TEXT,
+            strike REAL,
+            dte_actual INTEGER,
+            option_iv REAL NOT NULL,
+            realized_vol_20d REAL,
+            iv_to_rv REAL,
+            source TEXT DEFAULT 'tradier',
+            UNIQUE(market_date, ticker, direction, expiration, strike)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_signals_ticker ON signals(ticker);
         CREATE INDEX IF NOT EXISTS idx_outcomes_due ON outcomes(status, due_at);
+        CREATE INDEX IF NOT EXISTS idx_iv_history_ticker ON option_iv_history(ticker, created_at);
         """
     )
     _ensure_columns(con, "signals", {
@@ -167,6 +186,10 @@ def init_db(con: sqlite3.Connection) -> None:
         "sentiment_price_score_adjustment": "REAL",
         "data_quality_score": "REAL",
         "price_spike_pct": "REAL",
+        "iv_rank": "REAL",
+        "iv_percentile": "REAL",
+        "iv_history_count": "INTEGER",
+        "iv_rank_reason": "TEXT",
     })
     con.commit()
 
@@ -234,38 +257,40 @@ def _parsed_signal_for_ticker(parsed_signals: list[dict], ticker: str) -> dict:
 
 def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: list[dict],
                        clusters: list[dict] | None = None) -> None:
-    """Schreibt alle geprüften Ticker inkl. Options-/SEC-/Kostenfeldern."""
+    """Schreibt alle geprüften Ticker inkl. Options-/SEC-/Kostenfeldern atomar."""
     clusters = clusters or []
     con = connect()
     created = utc_now()
-    signal_ids = []
+    signal_ids: list[tuple[int, float | None]] = []
 
-    for d in market_data:
-        ticker = d.get("ticker", "")
-        ps = _parsed_signal_for_ticker(parsed_signals, ticker)
-        opt = d.get("options") or {}
-        sec = {
-            "sec_bullish": d.get("sec_bullish"),
-            "sec_bearish": d.get("sec_bearish"),
-            "sec_insider": d.get("sec_insider"),
-            "sec_reason": d.get("sec_reason"),
-            "sec_confidence": d.get("sec_confidence"),
-        }
-        cur = con.execute(
-            """
-            INSERT INTO signals(
-                run_id, created_at, ticker, direction, signal_strength, horizon, dte_days,
-                cluster_json, market_json, option_json, sec_json, price, change_pct, rel_vol,
-                score, score_reason, liquidity_fail, liquidity_reason, ev_ok, ev_pct,
-                ev_dollars, conservative_entry, data_quality_ok, data_quality_reason,
-                no_trade_reason, quote_source, option_source, realized_vol_20d, option_iv,
-                iv_to_rv, exit_slippage_points, earnings_iv_ok, earnings_iv_reason,
-                sector, sector_etf, sector_change_pct, market_change_pct, relative_to_sector_pct,
-                sector_filter_ok, sector_filter_reason, sentiment_price_label,
-                sentiment_price_score_adjustment, data_quality_score, price_spike_pct
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+    columns = [
+        "run_id", "created_at", "ticker", "direction", "signal_strength", "horizon", "dte_days",
+        "cluster_json", "market_json", "option_json", "sec_json", "price", "change_pct", "rel_vol",
+        "score", "score_reason", "liquidity_fail", "liquidity_reason", "ev_ok", "ev_pct",
+        "ev_dollars", "conservative_entry", "data_quality_ok", "data_quality_reason",
+        "no_trade_reason", "quote_source", "option_source", "realized_vol_20d", "option_iv",
+        "iv_to_rv", "exit_slippage_points", "earnings_iv_ok", "earnings_iv_reason",
+        "sector", "sector_etf", "sector_change_pct", "market_change_pct", "relative_to_sector_pct",
+        "sector_filter_ok", "sector_filter_reason", "sentiment_price_label",
+        "sentiment_price_score_adjustment", "data_quality_score", "price_spike_pct",
+        "iv_rank", "iv_percentile", "iv_history_count", "iv_rank_reason",
+    ]
+    placeholders = ", ".join(["?"] * len(columns))
+    sql = f"INSERT INTO signals({', '.join(columns)}) VALUES ({placeholders})"
+
+    with con:
+        for d in market_data:
+            ticker = d.get("ticker", "")
+            ps = _parsed_signal_for_ticker(parsed_signals, ticker)
+            opt = d.get("options") or {}
+            sec = {
+                "sec_bullish": d.get("sec_bullish"),
+                "sec_bearish": d.get("sec_bearish"),
+                "sec_insider": d.get("sec_insider"),
+                "sec_reason": d.get("sec_reason"),
+                "sec_confidence": d.get("sec_confidence"),
+            }
+            values = [
                 run_id, iso(created), ticker, d.get("news_direction") or ps.get("direction"),
                 ps.get("score"), ps.get("horizon"), ps.get("dte_days"),
                 _json(_cluster_for_ticker(clusters, ticker)), _json(d), _json(opt), _json(sec),
@@ -283,59 +308,143 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
                 1 if d.get("sector_filter_ok", True) else 0, d.get("sector_filter_reason", ""),
                 d.get("sentiment_price_label", ""), d.get("sentiment_price_score_adjustment"),
                 d.get("data_quality_score"), d.get("price_spike_pct"),
-            ),
-        )
-        signal_id = int(cur.lastrowid)
-        signal_ids.append((signal_id, d.get("price")))
+                opt.get("iv_rank"), opt.get("iv_percentile"), opt.get("iv_history_count"),
+                opt.get("iv_rank_reason", ""),
+            ]
+            cur = con.execute(sql, values)
+            signal_id = int(cur.lastrowid)
+            signal_ids.append((signal_id, d.get("price")))
+            _record_iv_snapshot(con, run_id, signal_id, ticker, d.get("news_direction") or ps.get("direction"), opt)
 
-    # Outcome-Zeitpunkte anlegen.
-    for signal_id, start_price in signal_ids:
-        if not start_price or start_price <= 0:
-            continue
-        for horizon, delta in OUTCOME_HORIZONS.items():
-            if delta is None:
-                now = created
-                due = now.replace(hour=21, minute=0, second=0, microsecond=0)
-                if due <= now:
-                    due = now + timedelta(hours=1)
-            else:
-                due = created + delta
-            con.execute(
-                """
-                INSERT OR IGNORE INTO outcomes(signal_id, horizon, due_at, start_price)
-                VALUES (?, ?, ?, ?)
-                """,
-                (signal_id, horizon, iso(due), start_price),
-            )
+        # Outcome-Zeitpunkte anlegen.
+        for signal_id, start_price in signal_ids:
+            if not start_price or start_price <= 0:
+                continue
+            for horizon, delta in OUTCOME_HORIZONS.items():
+                if delta is None:
+                    now = created
+                    due = now.replace(hour=21, minute=0, second=0, microsecond=0)
+                    if due <= now:
+                        due = now + timedelta(hours=1)
+                else:
+                    due = created + delta
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO outcomes(signal_id, horizon, due_at, start_price)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (signal_id, horizon, iso(due), start_price),
+                )
 
-    con.commit()
     con.close()
     logger.info("Journal: %d Signale gespeichert", len(signal_ids))
-
 
 def log_final_decision(run_id: int, result: dict) -> None:
     con = connect()
     no_trade = 1 if result.get("no_trade") else 0
     ticker = result.get("ticker", "")
     direction = result.get("direction", "")
-    con.execute(
-        """
-        UPDATE runs
-        SET no_trade=?, no_trade_reason=?, final_ticker=?, final_direction=?, final_payload_json=?
-        WHERE run_id=?
-        """,
-        (no_trade, result.get("no_trade_grund", ""), ticker, direction, _json(result), run_id),
-    )
-    if ticker:
+    with con:
         con.execute(
             """
-            UPDATE signals SET selected_trade = 1
-            WHERE run_id = ? AND ticker = ? AND direction = ?
+            UPDATE runs
+            SET no_trade=?, no_trade_reason=?, final_ticker=?, final_direction=?, final_payload_json=?
+            WHERE run_id=?
             """,
-            (run_id, ticker, direction),
+            (no_trade, result.get("no_trade_grund", ""), ticker, direction, _json(result), run_id),
         )
-    con.commit()
+        if ticker:
+            con.execute(
+                """
+                UPDATE signals SET selected_trade = 1
+                WHERE run_id = ? AND ticker = ? AND direction = ?
+                """,
+                (run_id, ticker, direction),
+            )
     con.close()
+
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_iv_snapshot(con: sqlite3.Connection, run_id: int, signal_id: int,
+                        ticker: str, direction: str | None, opt: dict) -> None:
+    iv = _as_float((opt or {}).get("iv_decimal"))
+    if iv is None or iv <= 0:
+        return
+    strike = _as_float((opt or {}).get("strike"))
+    con.execute(
+        """
+        INSERT OR REPLACE INTO option_iv_history(
+            market_date, created_at, run_id, signal_id, ticker, direction, expiration,
+            strike, dte_actual, option_iv, realized_vol_20d, iv_to_rv, source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            utc_now().date().isoformat(), iso(), run_id, signal_id, ticker, direction,
+            (opt or {}).get("expiration"), strike, (opt or {}).get("dte_actual"), iv,
+            (opt or {}).get("realized_vol_20d"), (opt or {}).get("iv_to_rv"),
+            (opt or {}).get("option_source", "tradier"),
+        ),
+    )
+
+
+def get_iv_stats(ticker: str, current_iv: float | None, min_samples: int = 2) -> dict:
+    """
+    Eigener IV-Rank aus bereits journalisierten Options-IVs.
+    Keine Yahoo-/Underlying-Naeherung. Wenn Historie zu kurz ist, wird nur diagnostiziert.
+    """
+    iv = _as_float(current_iv)
+    if iv is None or iv <= 0:
+        return {
+            "iv_rank": None,
+            "iv_percentile": None,
+            "iv_history_count": 0,
+            "iv_rank_reason": "IV fehlt",
+        }
+
+    con = connect()
+    rows = con.execute(
+        """
+        SELECT option_iv FROM option_iv_history
+        WHERE ticker = ? AND option_iv > 0
+        ORDER BY created_at DESC
+        LIMIT 260
+        """,
+        (ticker.upper(),),
+    ).fetchall()
+    con.close()
+
+    values = [float(r[0]) for r in rows if r[0] is not None and float(r[0]) > 0]
+    n = len(values)
+    if n < min_samples:
+        return {
+            "iv_rank": None,
+            "iv_percentile": None,
+            "iv_history_count": n,
+            "iv_rank_reason": f"IV-Historie zu kurz: {n} Samples",
+        }
+
+    lo = min(values)
+    hi = max(values)
+    if hi <= lo:
+        iv_rank = 50.0
+    else:
+        iv_rank = max(0.0, min(100.0, (iv - lo) / (hi - lo) * 100.0))
+    percentile = sum(1 for v in values if v <= iv) / n * 100.0
+    return {
+        "iv_rank": round(iv_rank, 2),
+        "iv_percentile": round(percentile, 2),
+        "iv_history_count": n,
+        "iv_rank_reason": f"eigene Journal-Historie n={n}",
+    }
 
 
 def update_due_outcomes(cfg: dict, max_updates: int = 50) -> int:

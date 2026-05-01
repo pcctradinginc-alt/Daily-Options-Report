@@ -189,8 +189,15 @@ def main() -> int:
 
     logger.info("  Marktdaten fertig  (%.1fs)", time.monotonic() - t2)
 
-    if not any(d.get("score", 0) >= RULES.min_score and d.get("options", {}).get("ev_ok") for d in ranked):
-        logger.info("Kein Ticker besteht Datenqualität+Score+Liquidität+EV+Earnings-IV-Gates")
+    if not any(
+        d.get("score", 0) >= RULES.min_score
+        and d.get("_data_quality_ok")
+        and d.get("sector_filter_ok", True)
+        and not d.get("_liquidity_fail")
+        and d.get("options", {}).get("ev_ok")
+        for d in ranked
+    ):
+        logger.info("Kein Ticker besteht Datenqualität+Sektor+Score+Liquidität+EV+Earnings-IV-Gates")
         reject_reasons = []
         for d in ranked[:5]:
             reason = d.get("_no_trade_reason") or d.get("_score_reason") or "Gate nicht bestanden"

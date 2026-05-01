@@ -32,7 +32,7 @@ HARTE REGELN:
 - VIX 20-24.99 -> einsatz: 150
 - VIX < 20 -> einsatz: 250
 - Waehle NIEMALS einen Ticker mit Score < 50
-- Waehle NIEMALS einen Ticker mit Gate=FAIL, DATA_QUALITY_OK=False, EV_OK=False, EARN_IV_OK=False oder Liquiditaets-Hinweis
+- Waehle NIEMALS einen Ticker mit Gate=FAIL, DATA_QUALITY_OK=False, SECTOR_MARKET_OK=False, EV_OK=False, EARN_IV_OK=False oder Liquiditaets-Hinweis
 - Nutze conservative_entry/Entry als Einstiegspreis, NICHT blind Midpoint
 - kontrakte = floor(einsatz / (entry_price * 100))
 - stop_loss_eur = 30% von einsatz
@@ -40,9 +40,20 @@ HARTE REGELN:
 - Sentiment darf NIEMALS einen schlechten EV, schlechte Liquiditaet oder Earnings-IV-Block ueberschreiben
 
 DATENQUALITAET:
-- Tradier-Optionsdaten mit nicht-Tradier-Underlying sind kein Trade
-- Wenn Quote-Quelle oder Optionsdaten inkonsistent sind: no_trade true
-- Wenn No-Trade-Reason im Marktdatenblock steht, diese Begruendung uebernehmen
+- Tradier Production ist Standard. Sandbox/Delayed-Daten nur als Dry-run-Kontext betrachten.
+- Tradier-Optionsdaten mit nicht-Tradier-Underlying sind kein Trade.
+- Wenn Quote-Quelle oder Optionsdaten inkonsistent sind: no_trade true.
+- Wenn DATA_FLAGS auf kaputte Historie, Spike ohne News oder fehlende Basisdaten hinweisen: no_trade true.
+- Wenn No-Trade-Reason im Marktdatenblock steht, diese Begruendung uebernehmen.
+
+MARKT-/SEKTORFILTER:
+- CALL gegen schwachen SPY/QQQ/Sektor ohne relative Staerke ist kein Trade.
+- PUT gegen starken SPY/QQQ/Sektor ohne relative Schwaeche ist kein Trade.
+- Relative Staerke/Schwaeche darf den Score verbessern, aber nie EV/Liquiditaet/Datenqualitaet ueberschreiben.
+
+SENTIMENT/PREISREAKTION:
+- Nutze SentPx als Divergenzfeature: bearish_news_absorbed kann CALL bestaetigen, bullish_news_not_confirmed kann PUT bestaetigen.
+- SentPx ist nur Ranking/Timing, kein harter EV-Ersatz.
 
 RICHTUNGSLOGIK:
 - CALL darf positiv laufen: change_pct > 0 und ueber MA50 ist gut
@@ -69,7 +80,7 @@ ETF-SONDERREGEL:
 BEGRUENDUNG (begruendung_detail - 5 Felder, je max 2 Saetze, keine Anfuehrungszeichen):
 - ticker_wahl: Warum dieser Ticker? Score- und EV-Vergleich.
 - option_wahl: Strike, Delta, IV, IV/RV, Spread, Entry, ExitSlip, EV.
-- timing: Richtungsspezifisch: CALL vs PUT, MA50, RelVol, Trend.
+- timing: Richtungsspezifisch: CALL vs PUT, MA50, RelVol, Sektorfilter, SentPx-Divergenz.
 - chance_risiko: Einsatz, Entry, Break-even, Ziel, Stop.
 - risiko: Hauptrisiko inklusive Spread, Slippage, Datenqualitaet, Earnings/IV.
 
@@ -81,7 +92,7 @@ regime_farbe NUR: gruen, gelb oder rot
 Gib direction exakt aus den Marktdaten zurueck: CALL oder PUT.
 
 JSON-Schema:
-{"datum":"DD.MM.YYYY","vix":"WERT","regime":"TRENDING","regime_farbe":"gelb","no_trade":false,"no_trade_grund":"","vix_warnung":false,"direction":"CALL","ticker":"SYMBOL","strike":"WERT","laufzeit":"DATUM","delta":"WERT","iv":"WERT%","iv_to_rv":"WERT","bid":"WERT","ask":"WERT","midpoint":"WERT","conservative_entry":"WERT","entry_price":"WERT","exit_slippage_points":"WERT","fill_probability":"WERT","ev_pct":"WERT","ev_dollars":"WERT","breakeven_move_pct":"WERT","kontrakte":"N","einsatz":150,"stop_loss_eur":45,"unusual":false,"begruendung_detail":{"ticker_wahl":"...","option_wahl":"...","timing":"...","chance_risiko":"...","risiko":"..."},"markt":"...","strategie":"...","ausgeschlossen":"TICKER: GRUND","ticker_tabelle":[{"ticker":"USO","direction":"CALL","kurs":"120.89","chg":"+2.11%","ma50":"84.88","trend":"ueber MA50","relvol":"1.99","bull":"61.3%","score":"86.65","ev_ok":true,"ev_pct":"18.4","gewinner":true,"ausgeschlossen":false,"no_trade_reason":""}]}
+{"datum":"DD.MM.YYYY","vix":"WERT","regime":"TRENDING","regime_farbe":"gelb","no_trade":false,"no_trade_grund":"","vix_warnung":false,"direction":"CALL","ticker":"SYMBOL","strike":"WERT","laufzeit":"DATUM","delta":"WERT","iv":"WERT%","iv_to_rv":"WERT","bid":"WERT","ask":"WERT","midpoint":"WERT","conservative_entry":"WERT","entry_price":"WERT","exit_slippage_points":"WERT","fill_probability":"WERT","ev_pct":"WERT","ev_dollars":"WERT","breakeven_move_pct":"WERT","kontrakte":"N","einsatz":150,"stop_loss_eur":45,"unusual":false,"begruendung_detail":{"ticker_wahl":"...","option_wahl":"...","timing":"...","chance_risiko":"...","risiko":"..."},"markt":"...","strategie":"...","ausgeschlossen":"TICKER: GRUND","ticker_tabelle":[{"ticker":"USO","direction":"CALL","kurs":"120.89","chg":"+2.11%","ma50":"84.88","trend":"ueber MA50","sector":"XLE","rel_sector":"+0.85","sentpx":"bearish_news_absorbed","relvol":"1.99","bull":"61.3%","score":"86.65","ev_ok":true,"ev_pct":"18.4","gewinner":true,"ausgeschlossen":false,"no_trade_reason":""}]}
 """
 
 

@@ -1,14 +1,13 @@
 """
 report_generator.py — HTML-Report + Email-Versand (Step 3)
 
-Fixes gegenüber v1:
-- JSON end=0 Ambiguität aufgelöst: explizite found/not-found Logik
-- Bare excepts durch spezifische Exceptions ersetzt
-- Logging statt print()
-- VIX-Regeln und Einsatz-Berechnung Code-seitig via rules.py
-- Claude-Output wird gegen Schema validiert vor HTML-Generierung
+Fixes v2:
+- call_claude() nimmt vix_direct Parameter (Fix Nr. 1+2)
+- VIX aus main.py direkt genutzt — nicht aus Claude-JSON
+- build_html() zeigt PUT/CALL korrekt an (Fix Nr. 7)
 - _compress_summary(): Earnings-Liste auf 10 Ticker gekürzt
-- max_tokens 1100 → 1500, timeout 25 → 30s
+- max_tokens 1500, timeout 30s
+- Exit-Plan: Stop-Loss -40%, Take-Profit +50%, konkrete USD-Preise
 """
 
 import json
@@ -33,7 +32,7 @@ REGELN:
 - VIX 20-24.99 -> einsatz: 150
 - VIX < 20 -> einsatz: 250
 - Ausschluss: Score <50 | change_pct <0 | unter MA50 | Spread >2% | OI <5000
-- stop_loss_eur = 30% von einsatz
+- stop_loss_eur = 40% von einsatz
 - kontrakte = round(einsatz / (midpoint * 100)) wenn midpoint bekannt
 - bid/ask aus Marktdaten uebernehmen
 
@@ -53,8 +52,10 @@ TICKER_TABELLE: ALLE Ticker aus Marktdaten eintragen.
 Regime NUR: LOW-VOL, TRENDING oder HIGH-VOL
 regime_farbe NUR: gruen, gelb oder rot
 
+Gib auch das Feld direction zurueck: CALL oder PUT (aus den Marktdaten uebernehmen).
+
 JSON-Schema (valides JSON, kein Text davor/danach):
-{"datum":"DD.MM.YYYY","vix":"WERT","regime":"TRENDING","regime_farbe":"gelb","no_trade":false,"no_trade_grund":"","vix_warnung":false,"ticker":"SYMBOL","strike":"WERT","laufzeit":"DATUM","delta":"WERT","iv":"WERT%","bid":"WERT","ask":"WERT","midpoint":"WERT","kontrakte":"N","einsatz":150,"stop_loss_eur":45,"unusual":false,"begruendung_detail":{"ticker_wahl":"...","option_wahl":"...","timing":"...","chance_risiko":"...","risiko":"..."},"markt":"...","strategie":"...","ausgeschlossen":"TICKER: GRUND","ticker_tabelle":[{"ticker":"USO","kurs":"120.89","chg":"+2.11%","ma50":"84.88","trend":"ueber MA50","relvol":"1.99","bull":"61.3%","score":"86.65","gewinner":true,"ausgeschlossen":false}]}"""
+{"datum":"DD.MM.YYYY","vix":"WERT","regime":"TRENDING","regime_farbe":"gelb","no_trade":false,"no_trade_grund":"","vix_warnung":false,"direction":"CALL","ticker":"SYMBOL","strike":"WERT","laufzeit":"DATUM","delta":"WERT","iv":"WERT%","bid":"WERT","ask":"WERT","midpoint":"WERT","kontrakte":"N","einsatz":150,"stop_loss_eur":60,"unusual":false,"begruendung_detail":{"ticker_wahl":"...","option_wahl":"...","timing":"...","chance_risiko":"...","risiko":"..."},"markt":"...","strategie":"...","ausgeschlossen":"TICKER: GRUND","ticker_tabelle":[{"ticker":"USO","kurs":"120.89","chg":"+2.11%","ma50":"84.88","trend":"ueber MA50","relvol":"1.99","bull":"61.3%","score":"86.65","gewinner":true,"ausgeschlossen":false}]}"""
 
 
 # ══════════════════════════════════════════════════════════
@@ -62,7 +63,6 @@ JSON-Schema (valides JSON, kein Text davor/danach):
 # ══════════════════════════════════════════════════════════
 
 def repair_json_quotes(text: str) -> str:
-    """Repariert unescapte Anführungszeichen in JSON-String-Werten."""
     result, in_str, escaped, i = [], False, False, 0
     while i < len(text):
         ch = text[i]
@@ -90,7 +90,6 @@ def repair_json_quotes(text: str) -> str:
 
 
 def close_fragment(frag: str) -> str:
-    """Repariert abgeschnittenes JSON inkl. offener Strings."""
     in_str, i = False, 0
     while i < len(frag):
         if frag[i] == '\\' and in_str and i + 1 < len(frag):
@@ -118,10 +117,6 @@ def close_fragment(frag: str) -> str:
 
 
 def extract_json_fragment(text: str) -> str:
-    """
-    Explizite Suche nach JSON-Grenzen.
-    Ambiguität von rfind("}") == -1 → +1 = 0 aufgelöst.
-    """
     start = text.find("{")
     if start == -1:
         raise ValueError("Kein öffnendes { im Claude-Response")
@@ -137,11 +132,6 @@ def extract_json_fragment(text: str) -> str:
 # ══════════════════════════════════════════════════════════
 
 def _compress_summary(summary: str) -> str:
-    """
-    Kürzt den Market Summary für den Claude-Call.
-    Earnings-Liste kann 200+ Ticker enthalten → auf max 10 kürzen.
-    Verhindert JSON-Abschneiden durch token-limit.
-    """
     lines = summary.splitlines()
     result = []
     for line in lines:
@@ -160,7 +150,7 @@ def _compress_summary(summary: str) -> str:
 # CLAUDE CALL
 # ══════════════════════════════════════════════════════════
 
-def call_claude(summary: str, api_key: str) -> dict:
+def call_claude(summary: str, api_key: str, vix_direct=None) -> dict:
     summary = _compress_summary(summary)
 
     try:
@@ -196,7 +186,6 @@ def call_claude(summary: str, api_key: str) -> dict:
     except ValueError as e:
         raise ValueError("JSON-Extraktion fehlgeschlagen: " + str(e)) from e
 
-    # 4 Parse-Versuche mit steigender Reparatur
     parsers = [
         ("direkt",           lambda f: json.loads(f)),
         ("quote_repair",     lambda f: json.loads(repair_json_quotes(f))),
@@ -219,16 +208,15 @@ def call_claude(summary: str, api_key: str) -> dict:
         raise ValueError("JSON Parse Fehler nach 4 Versuchen: " + str(last_error) +
                          " | Raw: " + text[:300])
 
-    # Schema-Validierung
     is_valid, errors = validate_claude_output(result)
     if not is_valid:
         logger.warning("Claude-Output Schema-Fehler (werden korrigiert): %s", errors)
 
-    # VIX-Regeln Code-seitig durchsetzen (überschreibt Claude immer)
-    vix_raw = result.get("vix", "0")
-    result  = apply_vix_rules(vix_raw, result)
-    logger.info("VIX=%s Einsatz=%s no_trade=%s",
-                vix_raw, result.get("einsatz","?"), result.get("no_trade"))
+    # Autoritativen VIX nutzen — nicht Claude-JSON-Feld
+    authoritative_vix = vix_direct if vix_direct is not None else result.get("vix", "n/v")
+    result = apply_vix_rules(authoritative_vix, result)
+    logger.info("VIX=%s (direkt) Einsatz=%s no_trade=%s",
+                authoritative_vix, result.get("einsatz","?"), result.get("no_trade"))
 
     return result
 
@@ -277,8 +265,17 @@ def build_html(d: dict, today: str) -> str:
                           f'Morgen läuft die Analyse erneut.</p></div>')
     else:
         einsatz   = d.get("einsatz", 150)
-        stop_loss = d.get("stop_loss_eur", round(einsatz * 0.3))
+        stop_loss = d.get("stop_loss_eur", round(einsatz * 0.4))
+
+        # Richtung korrekt aus Daten lesen
+        direction     = d.get("direction", "CALL")
+        direction_str = "Long Call" if direction != "PUT" else "Long Put"
+        direction_col = G if direction != "PUT" else O
+        trade_icon    = "✅" if direction != "PUT" else "🔽"
+        card_bg       = "#e8f5e9" if direction != "PUT" else "#fff3e0"
+
         trade_rows = (
+            row("Richtung",            direction_str, direction_col) +
             row("Strike",              d.get("strike","n/v")) +
             row("Laufzeit",            d.get("laufzeit","n/v")) +
             row("Delta",               d.get("delta","n/v")) +
@@ -287,8 +284,8 @@ def build_html(d: dict, today: str) -> str:
             row("Einstieg (Midpoint)", d.get("midpoint","n/v")) +
             row("Kontrakte",           str(d.get("kontrakte","n/v"))) +
             row("Einsatz",             str(einsatz) + "€") +
-            row("Stop-Loss",           "–30% = max. " + str(stop_loss) + "€", R) +
-            row("Take-Profit 1",       "+40% → 50% verkaufen", G) +
+            row("Stop-Loss",           "–40% = max. " + str(stop_loss) + "€", R) +
+            row("Take-Profit 1",       "+50% → 50% verkaufen", G) +
             row("Take-Profit 2",       "Rest mit –10% Stop", G) +
             row("Unusual Activity",    "JA 🔥" if d.get("unusual") else "nein",
                 O if d.get("unusual") else DK, last=True)
@@ -311,8 +308,9 @@ def build_html(d: dict, today: str) -> str:
                      f'<p style="margin:0;font-size:12px;color:{DK};line-height:1.5;">{text}</p>'
                      f'</div></div>')
         trade_card = card(
-            "✅", "#e8f5e9",
-            d.get("ticker","") + f' <span style="font-size:14px;color:{GR};">Long Call</span>',
+            trade_icon, card_bg,
+            d.get("ticker","") +
+            f' <span style="font-size:14px;color:{direction_col};">{direction_str}</span>',
             trade_rows +
             f'<div style="margin-top:20px;background:{BG};border-radius:14px;'
             f'padding:8px 16px 4px 16px;">'
@@ -330,14 +328,43 @@ def build_html(d: dict, today: str) -> str:
                        f'Erhöhte Volatilität (VIX 20–24) – Einsatz auf '
                        f'<strong>{d.get("einsatz",150)}€</strong> reduziert</span></div>')
 
-    # ── Exit Plan ─────────────────────────────────────────
+    # ── Exit Plan mit konkreten USD-Preisen ───────────────
     exit_card = ""
     if not no_trade:
-        stop_e    = d.get("stop_loss_eur", round(d.get("einsatz",150) * 0.3))
+        stop_pct = 0.40
+        tp1_pct  = 0.50
+        stop_e   = round(d.get("einsatz", 150) * stop_pct)
+
+        try:
+            mid_f = float(str(d.get("midpoint", "0")).replace(",", "."))
+        except (ValueError, TypeError):
+            mid_f = 0.0
+
+        try:
+            kontr = int(str(d.get("kontrakte", "1")).replace("n/v", "1"))
+        except (ValueError, TypeError):
+            kontr = 1
+
+        if mid_f > 0:
+            stop_usd   = round(mid_f * (1 - stop_pct), 2)
+            tp1_usd    = round(mid_f * (1 + tp1_pct), 2)
+            tp2_usd    = round(tp1_usd * 0.90, 2)
+            cost_total = round(mid_f * 100 * kontr, 2)
+            cost_str   = f"Einstieg: {mid_f:.2f} USD × {kontr} Kontrakt(e) = {cost_total:.2f} USD"
+            stop_str   = f"–40% → {stop_usd:.2f} USD (max. {stop_e}€ Verlust)"
+            tp1_str    = f"+50% → {tp1_usd:.2f} USD | 50% schließen"
+            tp2_str    = f"Rest mit –10% Stop → {tp2_usd:.2f} USD"
+        else:
+            cost_str = "Einstieg: n/v"
+            stop_str = f"–40% = max. {stop_e}€"
+            tp1_str  = "+50% → 50% schließen"
+            tp2_str  = "Rest mit –10% Stop"
+
         exit_card = card("🎯", "#fff3e0", "Exit-Plan",
-                         row("Stop-Loss",       "–30% = max. " + str(stop_e) + "€", R) +
-                         row("Take-Profit 1",   "+40% → 50% schließen", G) +
-                         row("Take-Profit 2",   "Rest mit –10% Stop", G) +
+                         row("Gesamtkosten",   cost_str) +
+                         row("Stop-Loss",       stop_str, R) +
+                         row("Take-Profit 1",   tp1_str, G) +
+                         row("Take-Profit 2",   tp2_str, G) +
                          row("Zeit-Exit",       "<10 Tage bis Verfall → schließen") +
                          row("Delta Rebalance", "Delta > ±0.30 → prüfen") +
                          row("Vega Exit",       "IV +20% → 50% schließen", last=True))
@@ -411,8 +438,14 @@ def build_html(d: dict, today: str) -> str:
                         f'{th("Trend","center")}{th("RelVol")}{th("Bull%")}{th("Score")}'
                         f'</tr></thead><tbody>{rows_html}</tbody></table>')
 
-    status     = "NO TRADE" if no_trade else "TRADE · " + d.get("ticker","")
-    status_col = R if no_trade else G
+    # Status-Zeile zeigt korrekte Richtung
+    if no_trade:
+        status     = "NO TRADE"
+        status_col = R
+    else:
+        direction  = d.get("direction", "CALL")
+        status     = ("CALL · " if direction != "PUT" else "PUT · ") + d.get("ticker","")
+        status_col = G if direction != "PUT" else O
 
     return (f'<html><head><meta charset="UTF-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1.0"></head>'
@@ -507,7 +540,7 @@ if __name__ == "__main__":
         raise SystemExit("Kein Market Summary angegeben")
 
     today   = datetime.now().strftime("%d.%m.%Y")
-    subject = "📊 Daily Options Report – " + today
+    subject = "Daily Options Report – " + today
 
     data        = call_claude(market_summary, cfg.get("anthropic_api_key",""))
     html_report = build_html(data, today)

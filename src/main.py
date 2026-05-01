@@ -25,6 +25,10 @@ from market_data import (
 )
 from report_generator import call_claude, build_html, send_email
 from rules import parse_ticker_signals, RULES
+from trading_journal import (
+    create_run, update_run_context, log_market_signals,
+    log_final_decision, update_due_outcomes,
+)
 
 
 def setup_logging(verbose: bool) -> None:
@@ -56,8 +60,15 @@ def main() -> int:
         logger.error("Konfiguration unvollständig — siehe config/config.example.yaml")
         return 1
 
+    # Frühere Signale nachträglich bewerten, bevor der neue Lauf startet.
+    try:
+        update_due_outcomes(cfg)
+    except Exception as e:
+        logger.warning("Outcome-Update übersprungen: %s", e)
+
     today   = datetime.now().strftime("%d.%m.%Y")
     t_start = time.monotonic()
+    run_id  = create_run()
 
     logger.info("=" * 50)
     logger.info("  Daily Options Report — %s", today)
@@ -77,6 +88,8 @@ def main() -> int:
 
     logger.info("  %d Artikel | %d Cluster | %s (%s)",
                 len(articles), len(clusters), market_time, market_status)
+    update_run_context(run_id, market_status=market_status,
+                       article_count=len(articles), cluster_count=len(clusters))
 
     if args.verbose:
         for c in clusters[:5]:
@@ -94,10 +107,14 @@ def main() -> int:
     # VIX direkt holen — autoritativer Wert
     vix_value = get_vix()
     logger.info("  VIX: %s", vix_value)
+    update_run_context(run_id, market_status=market_status, vix=vix_value,
+                       raw_ticker_signals=ticker_signals,
+                       article_count=len(articles), cluster_count=len(clusters))
 
     # Kein Signal → No-Trade Email
     if ticker_signals in ("TICKER_SIGNALS:NONE", ""):
         logger.info("Keine validen Signale heute")
+        log_final_decision(run_id, {"no_trade": True, "no_trade_grund": "Kein valides Signal", "vix": vix_value})
         html    = _no_trade_html(today, vix_value, market_status, clusters[:3])
         subject = "⏸️ Daily Options Report – Kein Trade heute – " + today
         _send_or_save(html, subject, cfg, args.dry_run)
@@ -153,6 +170,12 @@ def main() -> int:
     # ── SEC EDGAR Check ───────────────────────────────────
     _run_sec_check(market_data)
 
+    # ── Journal: alle Signale/Marktdaten/Options-EV speichern ──
+    try:
+        log_market_signals(run_id, parsed_signals, market_data, clusters)
+    except Exception as e:
+        logger.warning("Journal-Signal-Log fehlgeschlagen: %s", e)
+
     ranked       = sorted(market_data, key=lambda x: x["score"], reverse=True)
     unusual_list = [d["ticker"] for d in market_data if d.get("unusual")]
     failed       = [d["ticker"] for d in market_data if d.get("_src_quote") == "failed"]
@@ -166,6 +189,21 @@ def main() -> int:
 
     logger.info("  Marktdaten fertig  (%.1fs)", time.monotonic() - t2)
 
+    if not any(d.get("score", 0) >= RULES.min_score and d.get("options", {}).get("ev_ok") for d in ranked):
+        logger.info("Kein Ticker besteht Score+Liquidität+EV-Filter")
+        data = {
+            "datum": today, "vix": str(vix_value), "regime": "TRENDING",
+            "regime_farbe": "gelb", "no_trade": True,
+            "no_trade_grund": "Kein Kandidat mit positivem Options EV",
+            "ticker_tabelle": [],
+        }
+        log_final_decision(run_id, data)
+        html_report = _no_trade_html(today, vix_value, market_status, clusters[:3])
+        subject = "⏸️ Daily Options Report – No Trade – " + today
+        _send_or_save(html_report, subject, cfg, args.dry_run)
+        logger.info("Fertig in %.1fs", time.monotonic() - t_start)
+        return 0
+
     # ══════════════════════════════════════════════════════
     # STEP 3: REPORT + EMAIL
     # ══════════════════════════════════════════════════════
@@ -175,6 +213,7 @@ def main() -> int:
     try:
         data        = call_claude(market_summary, cfg.get("anthropic_api_key",""),
                                   vix_direct=vix_value)
+        log_final_decision(run_id, data)
         html_report = build_html(data, today)
         no_trade    = data.get("no_trade", False)
         ticker      = data.get("ticker","")
@@ -187,6 +226,7 @@ def main() -> int:
                     time.monotonic() - t3)
     except (ValueError, RuntimeError) as e:
         logger.error("Report-Fehler: %s", e)
+        log_final_decision(run_id, {"no_trade": True, "no_trade_grund": "Report Fehler", "error": str(e)})
         html_report = _error_html(str(e), today)
         subject     = "⚠️ Daily Options Report – Fehler – " + today
 

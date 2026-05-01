@@ -101,6 +101,7 @@ KNOWN_TICKERS = {
     "NKE","LULU","TGT","SBUX","CMG","YUM","DPZ",
     "F","GM","RIVN","LCID","TM","HMC","STLA",
     "PLTR","ARM","CRWD","MRVL","SMCI",
+    "KTOS","WDC","RDDT",
 }
 
 TICKER_ALIASES = {
@@ -123,6 +124,9 @@ TICKER_ALIASES = {
     "Marvell": "MRVL", "Intel": "INTC",
     "Super Micro": "SMCI", "Supermicro": "SMCI",
     "Broadcom": "AVGO", "ARM Holdings": "ARM",
+    "Sandisk": "WDC", "Western Digital": "WDC",
+    "Kratos": "KTOS", "Kratos Defense": "KTOS",
+    "Reddit": "RDDT",
 }
 
 MACRO_TICKER_MAP = {

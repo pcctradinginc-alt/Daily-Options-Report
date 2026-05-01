@@ -100,7 +100,7 @@ def main() -> int:
     if ticker_signals in ("TICKER_SIGNALS:NONE", ""):
         logger.info("Keine validen Signale heute")
         html    = _no_trade_html(today, vix_value, market_status, clusters[:3])
-        subject = "⏸️ Kein Trade heute – " + today
+        subject = "⏸️ Daily Options Report – Kein Trade heute – " + today
         _send_or_save(html, subject, cfg, args.dry_run)
         logger.info("Fertig in %.1fs", time.monotonic() - t_start)
         return 0
@@ -171,8 +171,8 @@ def main() -> int:
         no_trade    = data.get("no_trade", False)
         ticker      = data.get("ticker","")
         subject     = (
-            "⏸️ No Trade heute – " + today if no_trade
-            else "📊 Options Report – " + today + " · " + ticker
+            "⏸️ Daily Options Report – No Trade – " + today if no_trade
+            else "📊 Daily Options Report – " + today + " · " + ticker
         )
         logger.info("  Ergebnis: %s  (%.1fs)",
                     "NO TRADE" if no_trade else "TRADE " + ticker,
@@ -180,7 +180,7 @@ def main() -> int:
     except (ValueError, RuntimeError) as e:
         logger.error("Report-Fehler: %s", e)
         html_report = _error_html(str(e), today)
-        subject     = "⚠️ Fehler – " + today
+        subject = "⚠️ Daily Options Report – Fehler – " + today
 
     _send_or_save(html_report, subject, cfg, args.dry_run)
     logger.info("Fertig in %.1fs", time.monotonic() - t_start)

@@ -46,11 +46,17 @@ def load_config() -> dict:
         "GMAIL_RECIPIENT":   "gmail_recipient",
         "SMTP_SENDER":       "smtp_sender",
         "SMTP_PASSWORD":     "smtp_password",
+        "TRADIER_SANDBOX":   "tradier_sandbox",
+        "SEC_USER_AGENT":    "sec_user_agent",
     }
     for env_var, key in env_map.items():
         val = os.environ.get(env_var)
-        if val:
+        if val is not None and str(val).strip() != "":
             config[key] = val.strip()
+
+    # Bool-Normalisierung fuer GitHub Actions Secrets/Env
+    if isinstance(config.get("tradier_sandbox"), str):
+        config["tradier_sandbox"] = config["tradier_sandbox"].lower() in ("1", "true", "yes", "y")
 
     return config
 

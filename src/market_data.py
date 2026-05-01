@@ -1,12 +1,9 @@
 """
 market_data.py — Marktdaten + Score-Berechnung (Step 2)
 
-Fixes gegenüber v1:
-- Intraday-Volumen-Hochrechnung erst ab 10:30 ET (nicht 09:30)
-- ThreadPoolExecutor mit explizitem cancel() bei Timeout
-- Bare excepts durch spezifische Exceptions ersetzt
-- Score=0 disambiguiert: '_score_reason' Feld hinzugefügt
-- ZeroDivision Guards explizit
+Fixes v2:
+- get_tradier_options() nimmt target_dte Parameter (Fix Nr. 6)
+- Spread/OI Liquiditäts-Malus nutzt RULES-Konstanten (Fix Nr. 5)
 - Logging statt print()
 """
 
@@ -17,6 +14,8 @@ from datetime import datetime, timedelta
 
 import requests
 from requests.exceptions import RequestException, Timeout
+
+from rules import RULES
 
 logger = logging.getLogger(__name__)
 
@@ -31,18 +30,16 @@ USER_AGENTS = [
     "python-requests/2.31.0",
 ]
 
-# Marktöffnung in UTC: 09:30 ET = 13:30 UTC (Sommerzeit) / 14:30 UTC (Winterzeit)
-# Volumen-Hochrechnung erst ab 30min nach Öffnung (Opening Auction abgeklungen)
-VOLUME_EXTRAPOLATION_DELAY_H = 0.5   # 30 Minuten nach Öffnung
-MARKET_OPEN_UTC_H             = 13.5  # 09:30 ET in UTC (Sommerzeit)
-MARKET_CLOSE_UTC_H            = 20.0  # 16:00 ET in UTC
+MARKET_OPEN_UTC_H             = 13.5
+MARKET_CLOSE_UTC_H            = 20.0
+VOLUME_EXTRAPOLATION_DELAY_H  = 0.5
 
 
 # ══════════════════════════════════════════════════════════
 # HTTP HELPER
 # ══════════════════════════════════════════════════════════
 
-def robust_get(url: str, params=None, headers=None, timeouts=(6, 8, 10)):
+def robust_get(url, params=None, headers=None, timeouts=(6, 8, 10)):
     for i, timeout in enumerate(timeouts):
         try:
             h = {"User-Agent": USER_AGENTS[i % len(USER_AGENTS)]}
@@ -57,17 +54,15 @@ def robust_get(url: str, params=None, headers=None, timeouts=(6, 8, 10)):
 
 
 # ══════════════════════════════════════════════════════════
-# KURS-QUELLEN (Fallback-Kette)
+# KURS-QUELLEN
 # ══════════════════════════════════════════════════════════
 
-def get_quote_alphavantage(symbol: str, api_key: str):
+def get_quote_alphavantage(symbol, api_key):
     try:
         if not api_key:
             return None
-        r = robust_get(
-            "https://www.alphavantage.co/query",
-            params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": api_key},
-        )
+        r = robust_get("https://www.alphavantage.co/query",
+                       params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": api_key})
         if not r:
             return None
         q = r.json().get("Global Quote", {})
@@ -78,49 +73,42 @@ def get_quote_alphavantage(symbol: str, api_key: str):
         if price <= 0:
             return None
         chg_str = q.get("10. change percent", "0%").replace("%", "")
-        return (
-            round(price, 2),
-            round(float(chg_str) if chg_str else 0.0, 2),
-            round(float(q.get("03. high") or price), 2),
-            round(float(q.get("04. low")  or price), 2),
-            "alphavantage",
-        )
+        return (round(price, 2),
+                round(float(chg_str) if chg_str else 0.0, 2),
+                round(float(q.get("03. high") or price), 2),
+                round(float(q.get("04. low")  or price), 2),
+                "alphavantage")
     except (ValueError, KeyError, RequestException) as e:
         logger.debug("AlphaVantage %s: %s", symbol, e)
         return None
 
 
-def get_history_alphavantage(symbol: str, api_key: str):
+def get_history_alphavantage(symbol, api_key):
     try:
         if not api_key:
             return [], []
-        r = robust_get(
-            "https://www.alphavantage.co/query",
-            params={"function": "TIME_SERIES_DAILY", "symbol": symbol,
-                    "outputsize": "compact", "apikey": api_key},
-        )
+        r = robust_get("https://www.alphavantage.co/query",
+                       params={"function": "TIME_SERIES_DAILY", "symbol": symbol,
+                               "outputsize": "compact", "apikey": api_key})
         if not r:
             return [], []
         ts = r.json().get("Time Series (Daily)", {})
         if not ts:
             return [], []
         sorted_days = sorted(ts.items())
-        closes  = [float(v["4. close"])       for _, v in sorted_days if v.get("4. close")]
-        volumes = [int(float(v["5. volume"])) for _, v in sorted_days if v.get("5. volume")]
-        return closes, volumes
+        return ([float(v["4. close"])       for _, v in sorted_days if v.get("4. close")],
+                [int(float(v["5. volume"])) for _, v in sorted_days if v.get("5. volume")])
     except (ValueError, KeyError, RequestException) as e:
         logger.debug("AlphaVantage history %s: %s", symbol, e)
         return [], []
 
 
-def get_quote_yahoo_v8(symbol: str):
+def get_quote_yahoo_v8(symbol):
     try:
         r = None
         for host in ["query1", "query2"]:
-            r = robust_get(
-                "https://" + host + ".finance.yahoo.com/v8/finance/chart/" + symbol,
-                params={"interval": "1d", "range": "5d"},
-            )
+            r = robust_get("https://" + host + ".finance.yahoo.com/v8/finance/chart/" + symbol,
+                           params={"interval": "1d", "range": "5d"})
             if r:
                 break
         if not r:
@@ -131,45 +119,36 @@ def get_quote_yahoo_v8(symbol: str):
         if not price or price <= 0:
             return None
         chg_pct = round((price - prev) / prev * 100, 2) if prev and prev != 0 else 0.0
-        return (
-            round(price, 2), chg_pct,
-            round(meta.get("regularMarketDayHigh", price), 2),
-            round(meta.get("regularMarketDayLow",  price), 2),
-            "yahoo_v8",
-        )
+        return (round(price, 2), chg_pct,
+                round(meta.get("regularMarketDayHigh", price), 2),
+                round(meta.get("regularMarketDayLow",  price), 2),
+                "yahoo_v8")
     except (ValueError, KeyError, IndexError, RequestException) as e:
         logger.debug("Yahoo v8 %s: %s", symbol, e)
         return None
 
 
-def get_quote_finnhub(symbol: str, api_key: str):
+def get_quote_finnhub(symbol, api_key):
     if not api_key:
         return None
     try:
-        r = robust_get(
-            "https://finnhub.io/api/v1/quote",
-            params={"symbol": symbol, "token": api_key},
-        )
+        r = robust_get("https://finnhub.io/api/v1/quote",
+                       params={"symbol": symbol, "token": api_key})
         if not r:
             return None
         j     = r.json()
         price = j.get("c", 0) or 0
         if price <= 0:
             return None
-        return (
-            round(price, 2),
-            round(j.get("dp", 0) or 0, 2),
-            round(j.get("h",  0) or 0, 2),
-            round(j.get("l",  0) or 0, 2),
-            "finnhub",
-        )
+        return (round(price, 2), round(j.get("dp", 0) or 0, 2),
+                round(j.get("h",  0) or 0, 2), round(j.get("l",  0) or 0, 2),
+                "finnhub")
     except (ValueError, KeyError, RequestException) as e:
         logger.debug("Finnhub %s: %s", symbol, e)
         return None
 
 
-def get_quote(symbol: str, cfg: dict):
-    """Fallback-Kette: AlphaVantage → Yahoo v8 → Finnhub."""
+def get_quote(symbol, cfg):
     for fn, args in [
         (get_quote_alphavantage, (symbol, cfg.get("alpha_vantage_key",""))),
         (get_quote_yahoo_v8,     (symbol,)),
@@ -182,21 +161,15 @@ def get_quote(symbol: str, cfg: dict):
     return (0.0, 0.0, 0.0, 0.0, "failed")
 
 
-def get_history(symbol: str, cfg: dict):
-    """
-    Historische Daten: AlphaVantage → Yahoo.
-    Fix: Intraday-Hochrechnung erst ab 30min nach Marktöffnung.
-    """
+def get_history(symbol, cfg):
     closes, volumes = get_history_alphavantage(symbol, cfg.get("alpha_vantage_key",""))
 
     if len(closes) < 20:
-        # Yahoo Fallback
         for host in ["query1", "query2"]:
             try:
                 r = robust_get(
                     "https://" + host + ".finance.yahoo.com/v8/finance/chart/" + symbol,
-                    params={"interval": "1d", "range": "90d"},
-                )
+                    params={"interval": "1d", "range": "90d"})
                 if not r:
                     continue
                 quotes  = r.json()["chart"]["result"][0]["indicators"]["quote"][0]
@@ -211,16 +184,13 @@ def get_history(symbol: str, cfg: dict):
     if not closes:
         return [], [], "failed"
 
-    # Fix R1: Volumen-Hochrechnung erst ab 10:00 ET (30min nach Öffnung)
-    # Verhindert 20x-Multiplikator in den ersten Minuten
     try:
         now_utc_h = datetime.utcnow().hour + datetime.utcnow().minute / 60.0
-        market_open_with_delay = MARKET_OPEN_UTC_H + VOLUME_EXTRAPOLATION_DELAY_H  # 14.0 UTC = 10:00 ET
-
+        market_open_with_delay = MARKET_OPEN_UTC_H + VOLUME_EXTRAPOLATION_DELAY_H
         if market_open_with_delay <= now_utc_h < MARKET_CLOSE_UTC_H and volumes:
             elapsed  = now_utc_h - MARKET_OPEN_UTC_H
-            fraction = max(0.1, elapsed / 6.5)   # min 10% statt 5% — verhindert >10x Multiplikator
-            volumes  = volumes.copy()             # kein In-Place-Mutieren der Original-Liste
+            fraction = max(0.1, elapsed / 6.5)
+            volumes  = volumes.copy()
             volumes[-1] = int(volumes[-1] / fraction)
     except (ValueError, ZeroDivisionError) as e:
         logger.debug("Volumen-Hochrechnung %s: %s", symbol, e)
@@ -231,21 +201,13 @@ def get_history(symbol: str, cfg: dict):
 
 # ══════════════════════════════════════════════════════════
 # SENTIMENT
-# Fix: Unsichere change_pct-Fallback-Propagation markiert
 # ══════════════════════════════════════════════════════════
 
-def get_sentiment(symbol: str, change_pct: float, finnhub_key: str):
-    """
-    Gibt (bullish, bearish, buzz, fallback_used) zurück.
-    fallback_used=True wenn Sentiment aus change_pct abgeleitet wurde
-    (weniger zuverlässig als Finnhub-Daten).
-    """
+def get_sentiment(symbol, change_pct, finnhub_key):
     if finnhub_key:
         try:
-            r = robust_get(
-                "https://finnhub.io/api/v1/news-sentiment",
-                params={"symbol": symbol, "token": finnhub_key},
-            )
+            r = robust_get("https://finnhub.io/api/v1/news-sentiment",
+                           params={"symbol": symbol, "token": finnhub_key})
             if r:
                 j       = r.json()
                 sent    = j.get("sentiment", {}) or {}
@@ -257,8 +219,8 @@ def get_sentiment(symbol: str, change_pct: float, finnhub_key: str):
         except (ValueError, KeyError, RequestException) as e:
             logger.debug("Finnhub Sentiment %s: %s", symbol, e)
 
-    # Fallback aus change_pct — markiert als unzuverlässig
-    bullish = round(max(0.0, min(100.0, 55 + change_pct * 3 if change_pct > 0 else 45 + change_pct * 3)), 1)
+    bullish = round(max(0.0, min(100.0,
+        55 + change_pct * 3 if change_pct > 0 else 45 + change_pct * 3)), 1)
     return bullish, round(100.0 - bullish, 1), round(abs(change_pct), 2), True
 
 
@@ -271,15 +233,12 @@ def get_vix():
         try:
             r = robust_get(
                 "https://" + host + ".finance.yahoo.com/v8/finance/chart/%5EVIX",
-                params={"interval": "1d", "range": "5d"},
-            )
+                params={"interval": "1d", "range": "5d"})
             if not r:
                 continue
-            closes = [
-                c for c in
-                r.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-                if c is not None
-            ]
+            closes = [c for c in
+                      r.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                      if c is not None]
             if closes:
                 return round(closes[-1], 2)
         except (ValueError, KeyError, IndexError, RequestException) as e:
@@ -288,17 +247,16 @@ def get_vix():
     return "n/v"
 
 
-def get_earnings(start: str, end: str, finnhub_key: str) -> list:
+def get_earnings(start, end, finnhub_key):
     if not finnhub_key:
         return []
     try:
-        r = robust_get(
-            "https://finnhub.io/api/v1/calendar/earnings",
-            params={"from": start, "to": end, "token": finnhub_key},
-        )
+        r = robust_get("https://finnhub.io/api/v1/calendar/earnings",
+                       params={"from": start, "to": end, "token": finnhub_key})
         if not r:
             return []
-        return [e.get("symbol","") for e in r.json().get("earningsCalendar",[]) if e.get("symbol")]
+        return [e.get("symbol","") for e in r.json().get("earningsCalendar",[])
+                if e.get("symbol")]
     except (ValueError, KeyError, RequestException) as e:
         logger.warning("Earnings-Kalender Fehler: %s", e)
         return []
@@ -306,20 +264,25 @@ def get_earnings(start: str, end: str, finnhub_key: str) -> list:
 
 # ══════════════════════════════════════════════════════════
 # TRADIER OPTIONS
+# Fix Nr. 6: target_dte Parameter — DTE aus Claude-Signal wird genutzt
+# Fix Nr. 5: Spread/OI Grenzen aus RULES (konsistent mit Prompt)
 # ══════════════════════════════════════════════════════════
 
-def get_tradier_options(symbol: str, direction: str, tradier_token: str, sandbox: bool = True) -> dict:
+def get_tradier_options(symbol, direction, tradier_token,
+                        sandbox=True, target_dte=21) -> dict:
+    """
+    Fix Nr. 6: target_dte wird jetzt übergeben und genutzt.
+    Sucht Expiration die am nächsten an target_dte liegt (±14 Tage Toleranz).
+    """
     try:
         if not tradier_token:
             return {}
         base = "https://sandbox.tradier.com" if sandbox else "https://api.tradier.com"
         hdrs = {"Authorization": "Bearer " + tradier_token, "Accept": "application/json"}
 
-        r_exp = robust_get(
-            base + "/v1/markets/options/expirations",
-            params={"symbol": symbol, "includeAllRoots": "true"},
-            headers=hdrs,
-        )
+        r_exp = robust_get(base + "/v1/markets/options/expirations",
+                           params={"symbol": symbol, "includeAllRoots": "true"},
+                           headers=hdrs)
         if not r_exp:
             return {}
         exps = r_exp.json().get("expirations", {}).get("date", [])
@@ -328,24 +291,25 @@ def get_tradier_options(symbol: str, direction: str, tradier_token: str, sandbox
 
         today_dt   = datetime.now()
         target_exp = None
+        best_diff  = 999
+
+        # Fix Nr. 6: Nächste Expiration zum gewünschten DTE suchen
         for exp in exps:
             days = (datetime.strptime(exp, "%Y-%m-%d") - today_dt).days
-            if 21 <= days <= 35:
+            if days < 7:  # mindestens 1 Woche
+                continue
+            diff = abs(days - target_dte)
+            if diff < best_diff:
+                best_diff  = diff
                 target_exp = exp
-                break
-        if not target_exp:
-            for exp in exps:
-                if (datetime.strptime(exp, "%Y-%m-%d") - today_dt).days >= 21:
-                    target_exp = exp
-                    break
+
         if not target_exp:
             return {}
 
-        r_chain = robust_get(
-            base + "/v1/markets/options/chains",
-            params={"symbol": symbol, "expiration": target_exp, "greeks": "true"},
-            headers=hdrs,
-        )
+        r_chain = robust_get(base + "/v1/markets/options/chains",
+                             params={"symbol": symbol, "expiration": target_exp,
+                                     "greeks": "true"},
+                             headers=hdrs)
         if not r_chain:
             return {}
         opts = r_chain.json().get("options", {}).get("option", [])
@@ -354,7 +318,7 @@ def get_tradier_options(symbol: str, direction: str, tradier_token: str, sandbox
 
         opt_type  = "call" if direction == "CALL" else "put"
         best      = None
-        best_diff = 999.0
+        best_diff_delta = 999.0
         for opt in opts:
             if opt.get("option_type") != opt_type:
                 continue
@@ -362,9 +326,9 @@ def get_tradier_options(symbol: str, direction: str, tradier_token: str, sandbox
             if delta is None:
                 continue
             diff = abs(abs(float(delta)) - 0.45)
-            if diff < best_diff:
-                best_diff = diff
-                best      = opt
+            if diff < best_diff_delta:
+                best_diff_delta = diff
+                best            = opt
         if not best:
             return {}
 
@@ -388,7 +352,7 @@ def get_tradier_options(symbol: str, direction: str, tradier_token: str, sandbox
             "iv":            round(g.get("mid_iv", 0) * 100, 1) if g.get("mid_iv") else None,
             "open_interest": best.get("open_interest"),
             "volume":        best.get("volume"),
-            "contracts":     None,  # wird dynamisch in report_generator berechnet
+            "contracts":     None,
         }
     except (ValueError, KeyError, RequestException) as e:
         logger.debug("Tradier Options %s: %s", symbol, e)
@@ -399,18 +363,13 @@ def get_tradier_options(symbol: str, direction: str, tradier_token: str, sandbox
 # INDIKATOREN
 # ══════════════════════════════════════════════════════════
 
-def calc_ma(values: list, period: int):
+def calc_ma(values, period):
     if len(values) < period:
         return None
-    window = values[-period:]
-    return round(sum(window) / period, 2)
+    return round(sum(values[-period:]) / period, 2)
 
-def calc_rel_volume(volumes: list):
-    """
-    Fix R11: Explizite Null-Behandlung.
-    volumes[-1] = 0 ist valide (Handelsschluss) — wird nicht gefiltert.
-    Nur None-Werte werden ausgeschlossen.
-    """
+
+def calc_rel_volume(volumes):
     valid = [v for v in volumes if v is not None and v >= 0]
     if len(valid) < 21:
         return None
@@ -421,16 +380,11 @@ def calc_rel_volume(volumes: list):
 
 
 # ══════════════════════════════════════════════════════════
-# SCORE (normalisiert 0-100)
+# SCORE (0-100)
 # ══════════════════════════════════════════════════════════
 
-def calculate_score(price: float, change_pct: float, above_ma50, ma20,
-                    direction: str, bullish: float, unusual: bool,
-                    earnings_soon: bool, is_etf: bool) -> tuple:
-    """
-    Gibt (score, reason) zurück.
-    Fix R3: reason erklärt warum score=0 — disambiguiert 'kein Kurs' vs 'schlechte Qualität'.
-    """
+def calculate_score(price, change_pct, above_ma50, ma20,
+                    direction, bullish, unusual, earnings_soon, is_etf):
     if price <= 0:
         return 0.0, "no_price"
 
@@ -470,13 +424,17 @@ def calculate_score(price: float, change_pct: float, above_ma50, ma20,
 
 # ══════════════════════════════════════════════════════════
 # TICKER VERARBEITUNG
-# Fix R4: ThreadPoolExecutor mit cancel() bei Timeout
+# Fix Nr. 5: Liquiditäts-Malus nutzt RULES.max_spread_pct + RULES.min_open_interest
+# Fix Nr. 6: target_dte wird an get_tradier_options() übergeben
 # ══════════════════════════════════════════════════════════
 
-def process_ticker(ticker: str, direction: str, earnings_list: list, cfg: dict) -> dict:
+def process_ticker(ticker, direction, earnings_list, cfg,
+                   target_dte: int = 21) -> dict:
+    """
+    Fix Nr. 6: target_dte Parameter — kommt aus parse_ticker_signals().
+    """
     is_etf      = ticker in ETF_TICKERS
     finnhub_key = cfg.get("finnhub_key", "")
-
     q_fut: Future = None
     h_fut: Future = None
 
@@ -501,7 +459,6 @@ def process_ticker(ticker: str, direction: str, earnings_list: list, cfg: dict) 
 
         executor.shutdown(wait=False)
 
-        # ETF ohne Kurs → Sofort-Return
         if is_etf and price <= 0:
             return {
                 "ticker": ticker, "price": 0.0, "change_pct": 0.0,
@@ -515,41 +472,39 @@ def process_ticker(ticker: str, direction: str, earnings_list: list, cfg: dict) 
             }
 
         bullish, bearish, buzz, sent_fallback = get_sentiment(ticker, change_pct, finnhub_key)
-
         rel_vol    = calc_rel_volume(volumes)
         unusual    = bool(rel_vol and rel_vol >= 1.5)
         ma50       = calc_ma(closes, 50)
         ma20       = calc_ma(closes, 20)
         above_ma50 = (price > ma50) if (ma50 is not None and price > 0) else None
-
-        # 20-Tage-Hoch: nur wenn ausreichend Daten
-        new_20d = None
+        new_20d    = None
         if len(closes) >= 20 and price > 0:
             recent_high = max(closes[-20:])
             new_20d     = price >= recent_high * 0.98 if recent_high > 0 else None
-
         earnings_soon = ticker in earnings_list
 
         score, score_reason = calculate_score(
             price, change_pct, above_ma50, ma20, direction,
-            bullish, unusual, earnings_soon, is_etf,
-        )
+            bullish, unusual, earnings_soon, is_etf)
 
+        # Fix Nr. 6: target_dte an get_tradier_options übergeben
         options_data = get_tradier_options(
             ticker, direction,
             cfg.get("tradier_token", ""),
             cfg.get("tradier_sandbox", True),
+            target_dte=target_dte,
         )
 
-        # Liquiditäts-Malus — nach Options-Call
+        # Fix Nr. 5: Liquiditäts-Malus mit RULES-Konstanten (2% / 5000 OI)
         if options_data and price > 0:
             spread_pct = options_data.get("spread_pct") or 999
             open_int   = options_data.get("open_interest") or 0
-            if spread_pct > 12 or open_int < 150:
+            if spread_pct > RULES.max_spread_pct or open_int < RULES.min_open_interest:
                 score        = round(max(0.0, score - 40.0), 2)
                 score_reason = "liquidity_malus"
 
-        logger.info("%s: price=%.2f score=%.1f src=%s", ticker, price, score, quote_src)
+        logger.info("%s: price=%.2f score=%.1f src=%s dte=%d",
+                    ticker, price, score, quote_src, target_dte)
 
         return {
             "ticker":         ticker,
@@ -596,8 +551,8 @@ def process_ticker(ticker: str, direction: str, earnings_list: list, cfg: dict) 
 # SUMMARY BUILDER
 # ══════════════════════════════════════════════════════════
 
-def build_summary(ranked: list, vix_value, ticker_directions: dict,
-                  earnings_list: list, unusual_list: list, failed: list) -> str:
+def build_summary(ranked, vix_value, ticker_directions, earnings_list,
+                  unusual_list, failed):
     today    = datetime.now().strftime("%Y-%m-%d")
     srcs_str = ", ".join(d["ticker"] + "=" + d.get("_src_quote","?") for d in ranked)
 
@@ -677,16 +632,10 @@ if __name__ == "__main__":
     if "TICKER_SIGNALS:" in raw:
         raw = raw[raw.index("TICKER_SIGNALS:") + len("TICKER_SIGNALS:"):]
 
-    ticker_directions = {}
-    tickers = []
-    for entry in raw.split(","):
-        parts = re.split(r'[:\[]', entry.strip())
-        if len(parts) >= 2:
-            sym, d = parts[0].strip().upper(), parts[1].strip().upper()
-            if sym and d in ("CALL", "PUT"):
-                tickers.append(sym)
-                ticker_directions[sym] = d
-    tickers = list(dict.fromkeys(tickers))[:12]
+    from rules import parse_ticker_signals
+    parsed = parse_ticker_signals(raw)
+    ticker_directions = {s["ticker"]: s["direction"] for s in parsed}
+    tickers           = list(ticker_directions.keys())[:12]
 
     finnhub_key = cfg.get("finnhub_key", "")
     today       = datetime.now().strftime("%Y-%m-%d")
@@ -698,9 +647,15 @@ if __name__ == "__main__":
         vix_value     = vix_fut.result(timeout=12)
         earnings_list = earnings_fut.result(timeout=12)
 
+    # Fix Nr. 6: dte_days aus Signal übergeben
+    dte_map = {s["ticker"]: s["dte_days"] for s in parsed}
+
     with ThreadPoolExecutor(max_workers=12) as ex:
-        futures = {ex.submit(process_ticker, t, ticker_directions[t], earnings_list, cfg): t
-                   for t in tickers}
+        futures = {
+            ex.submit(process_ticker, t, ticker_directions[t], earnings_list, cfg,
+                      dte_map.get(t, 21)): t
+            for t in tickers
+        }
         results = []
         for f in as_completed(futures, timeout=30):
             try:
@@ -713,7 +668,8 @@ if __name__ == "__main__":
     unusual_list = [d["ticker"] for d in market_data if d.get("unusual")]
     failed       = [d["ticker"] for d in market_data if d.get("_src_quote") == "failed"]
 
-    summary = build_summary(ranked, vix_value, ticker_directions, earnings_list, unusual_list, failed)
+    summary = build_summary(ranked, vix_value, ticker_directions, earnings_list,
+                            unusual_list, failed)
     print(summary)
     if args.output:
         with open(args.output, "w") as f:

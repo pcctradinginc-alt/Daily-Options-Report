@@ -151,6 +151,7 @@ AMBIGUOUS_TICKERS = {
 CORE_TICKERS = set(DEFAULT_TICKERS)
 
 TICKER_ALIASES = {
+    "C3.ai": "AI", "C3 AI": "AI", "C3.ai Inc": "AI", "C3.ai, Inc.": "AI",
     "J&J": "JNJ", "Johnson & Johnson": "JNJ",
     "Apple": "AAPL", "Microsoft": "MSFT",
     "Google": "GOOGL", "Alphabet": "GOOGL",
@@ -223,6 +224,8 @@ FILTER (verwirf sofort):
 - EARNINGS_PENALTY < 0.15
 - Ticker = UNKNOWN ohne klares Makro-Keyword (iran/oil/fed/gold/war/hormuz/china)
 - ADRs: TM, TSM, NVO, BABA, ASML, SAP, BP, AZN, GSK
+- Ticker AI nur akzeptieren, wenn im Cluster explizit C3.ai, C3 AI, NYSE: AI oder $AI steht.
+  Generische Headline wie "1 AI Stock" ist kein valider AI/C3.ai-Ticker.
 - Nur 1 Artikel UND FEED_TIER_MAX >= 3 UND CONFIDENCE < 1.5
 
 BEHALTE IMMER:
@@ -333,7 +336,16 @@ def _has_ticker_context(symbol: str, text: str, text_low: str) -> bool:
     sym = symbol.upper()
 
     if sym == "AI":
-        return any(k in text_low for k in ("c3.ai", "c3 ai", "nyse: ai", "$ai", " ai stock", " ai shares"))
+        # Sehr strikt: "AI stock" ist meistens nur ein Themenbegriff.
+        # C3.ai darf nur bei explizitem C3.ai-/Cashtag-/Exchange-Kontext entstehen.
+        return (
+            "c3.ai" in text_low
+            or "c3 ai" in text_low
+            or "c3.ai inc" in text_low
+            or re.search(r"\$AI\b", text) is not None
+            or re.search(r"\bNYSE\s*[:\-]?\s*AI\b", text, re.IGNORECASE) is not None
+            or re.search(r"\bAI\s*\(C3\.ai\)", text, re.IGNORECASE) is not None
+        )
 
     if sym == "EQR" and "eq resources" in text_low:
         return False
@@ -811,7 +823,8 @@ def _infer_direction_from_cluster(ticker: str, event_type: str, headline: str, s
     ticker = ticker.upper()
 
     # "AI" ist oft nur ein Thema, nicht das US-Ticker-Symbol C3.ai.
-    if ticker == "AI" and not any(k in text for k in ("c3.ai", "c3 ai", "nyse: ai", "$ai", " ai stock", " ai shares")):
+    # Deshalb nur mit explizitem C3.ai-/Cashtag-/Exchange-Kontext erlauben.
+    if ticker == "AI" and not any(k in text for k in ("c3.ai", "c3 ai", "c3.ai inc", "nyse: ai", "$ai", "ai (c3.ai)")):
         return None
 
     if ticker == "EQR" and "eq resources" in text:

@@ -23,16 +23,36 @@ from news_utils import article_fingerprint, canonicalize_url, near_duplicate_key
 logger = logging.getLogger(__name__)
 
 # Optionale finBERT Integration — Fail-safe
-# Wichtig: finbert_sentiment.py lädt das Modell lazy. Das dortige
-# FINBERT_AVAILABLE ist beim Import noch False; deshalb hier nur prüfen,
-# ob die Funktion importierbar ist.
+# Wichtig: finbert_sentiment.py lädt das Modell lazy. Deshalb wird hier
+# NICHT FINBERT_AVAILABLE geprüft. Wir importieren nur die Funktionen und
+# lösen den echten Modell-Load später durch get_finbert_sentiment_batch() aus.
 try:
-    from finbert_sentiment import get_finbert_sentiment_batch
-    FINBERT_AVAILABLE = True
-except ImportError:
-    FINBERT_AVAILABLE = False
+    from finbert_sentiment import (
+        get_finbert_sentiment_batch,
+        get_finbert_status,
+        is_finbert_enabled,
+    )
+    FINBERT_IMPORTABLE = True
+    FINBERT_IMPORT_ERROR = None
+except Exception as _finbert_import_error:
+    FINBERT_IMPORTABLE = False
+    FINBERT_IMPORT_ERROR = str(_finbert_import_error)
+
     def get_finbert_sentiment_batch(texts):
         return [0.0] * len(texts)
+
+    def get_finbert_status():
+        return {
+            "enabled": False,
+            "loaded": False,
+            "load_attempted": False,
+            "available": False,
+            "model": "ProsusAI/finbert",
+            "error": FINBERT_IMPORT_ERROR,
+        }
+
+    def is_finbert_enabled():
+        return False
 
 try:
     from universe import get_known_tickers
@@ -560,35 +580,46 @@ def cluster_articles(articles: list, earnings_map: dict) -> list:
     result = result[:12]
 
     # ── finBERT für Top-Cluster (Confidence > 2.0) ────────────────
-    if FINBERT_AVAILABLE:
-        top_clusters  = [c for c in result if c["confidence_score"] > 2.0]
-        top_headlines = [c["headline_repr"] for c in top_clusters]
-        if top_headlines:
-            try:
-                finbert_scores = get_finbert_sentiment_batch(top_headlines)
-                used = 0
-                for cluster, fb_score in zip(top_clusters, finbert_scores):
-                    if fb_score != 0.0:
-                        used += 1
-                        old_conf = cluster["confidence_score"]
-                        old_mult = cluster.get("sentiment_mult", 1.0)
-                        cluster["sentiment_score"]  = fb_score
-                        cluster["sentiment_source"] = "finbert"
-                        new_mult = sentiment_multiplier(fb_score)
-                        cluster["sentiment_mult"]   = new_mult
-                        # Confidence mit neuem Sentiment-Multiplikator
-                        if old_mult > 0:
-                            cluster["confidence_score"] = round(
-                                old_conf / old_mult * new_mult, 2
-                            )
-                if used:
-                    logger.info("finBERT: %d/%d Top-Cluster analysiert", used, len(top_headlines))
-                else:
-                    logger.debug("finBERT ohne verwertbaren Score — Keyword-Sentiment bleibt aktiv")
-            except Exception as e:
-                logger.warning("finBERT Cluster-Update fehlgeschlagen: %s", e)
-    else:
-        logger.debug("finBERT nicht importierbar — Keyword-Sentiment aktiv")
+    # Wichtig: Nicht auf einen statischen FINBERT_AVAILABLE-Importwert prüfen.
+    # Der Modell-Load passiert absichtlich erst beim Batch-Aufruf.
+    top_clusters  = [c for c in result if c["confidence_score"] > 2.0]
+    top_headlines = [c["headline_repr"] for c in top_clusters]
+
+    if not FINBERT_IMPORTABLE:
+        logger.debug("finBERT nicht importierbar — Keyword-Sentiment aktiv: %s", FINBERT_IMPORT_ERROR)
+    elif not is_finbert_enabled():
+        logger.info("finBERT per ENABLE_FINBERT deaktiviert — Keyword-Sentiment aktiv")
+    elif top_headlines:
+        try:
+            finbert_scores = get_finbert_sentiment_batch(top_headlines)
+            used = 0
+            for cluster, fb_score in zip(top_clusters, finbert_scores):
+                # 0.0 kann echtes neutrales Sentiment oder Fallback bedeuten.
+                # Nur nicht-neutrale Scores überschreiben den Keyword-Wert.
+                if fb_score != 0.0:
+                    used += 1
+                    old_conf = cluster["confidence_score"]
+                    old_mult = cluster.get("sentiment_mult", 1.0)
+                    cluster["sentiment_score"]  = fb_score
+                    cluster["sentiment_source"] = "finbert"
+                    new_mult = sentiment_multiplier(fb_score)
+                    cluster["sentiment_mult"]   = new_mult
+                    if old_mult > 0:
+                        cluster["confidence_score"] = round(
+                            old_conf / old_mult * new_mult, 2
+                        )
+
+            status = get_finbert_status()
+            if used:
+                logger.info("finBERT: %d/%d Top-Cluster analysiert", used, len(top_headlines))
+            elif status.get("load_attempted") and status.get("error"):
+                logger.warning("finBERT nicht nutzbar — Keyword-Sentiment aktiv: %s", status.get("error"))
+            elif status.get("loaded"):
+                logger.debug("finBERT geladen, aber Scores neutral — Keyword-Sentiment bleibt aktiv")
+            else:
+                logger.debug("finBERT ohne verwertbaren Score — Keyword-Sentiment bleibt aktiv")
+        except Exception as e:
+            logger.warning("finBERT Cluster-Update fehlgeschlagen — Keyword-Sentiment bleibt aktiv: %s", e)
 
     # Nach finBERT neu sortieren
     result.sort(key=lambda x: x["confidence_score"], reverse=True)
@@ -958,8 +989,15 @@ if __name__ == "__main__":
     if not validate_config(cfg):
         raise SystemExit("Konfiguration unvollständig")
 
-    logger.info("finBERT: %s", "aktiv" if FINBERT_AVAILABLE else
-                "nicht verfügbar — Keyword-Sentiment aktiv")
+    fb_status = get_finbert_status()
+    logger.info(
+        "finBERT: importable=%s enabled=%s loaded=%s attempted=%s error=%s",
+        FINBERT_IMPORTABLE,
+        fb_status.get("enabled"),
+        fb_status.get("loaded"),
+        fb_status.get("load_attempted"),
+        fb_status.get("error"),
+    )
 
     articles     = fetch_all_feeds()
     earnings_map = build_earnings_map(cfg.get("finnhub_key",""))

@@ -2,7 +2,9 @@ name: Daily Options Report
 
 on:
   schedule:
-    - cron: '30 14 * * 1-5'   # Mo–Fr 14:30 UTC = 10:30 ET
+    # GitHub cron ist UTC und kennt keine US-DST. Zwei Slots vermeiden 09:30-ET-Fehler.
+    - cron: '30 14 * 3-10 1-5'  # ca. 10:30 ET waehrend US-DST
+    - cron: '30 15 * 1,2,11,12 1-5'  # ca. 10:30 ET Standardzeit
 
   workflow_dispatch:
     inputs:
@@ -25,9 +27,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Dependencies installieren
         run: pip install -r requirements.txt
+
+      - name: Journal-Cache wiederherstellen
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: trading-journal-${{ github.run_id }}
+          restore-keys: |
+            trading-journal-
 
       - name: Bot ausführen
         env:
@@ -38,6 +49,7 @@ jobs:
           GMAIL_RECIPIENT:   ${{ secrets.GMAIL_RECIPIENT }}
           SMTP_SENDER:       ${{ secrets.SMTP_SENDER }}
           SMTP_PASSWORD:     ${{ secrets.SMTP_PASSWORD }}
+          SEC_USER_AGENT:    ${{ secrets.SEC_USER_AGENT }}
           TRADIER_SANDBOX:   "false"
         run: |
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
@@ -53,3 +65,10 @@ jobs:
           name: report-preview
           path: report_preview.html
           retention-days: 7
+      - name: Journal speichern
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading-journal
+          path: data/
+          retention-days: 30

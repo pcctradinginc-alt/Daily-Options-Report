@@ -21,7 +21,8 @@ from email.mime.text import MIMEText
 import requests
 from requests.exceptions import RequestException, Timeout
 
-from rules import apply_vix_rules, validate_claude_output, RULES
+from rules import apply_vix_rules, RULES
+from llm_schema import validate_report_payload, build_cancelled_report
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +67,11 @@ OPTIONS-EV UND KOSTEN:
 - Bevorzuge hoechstes EV%, positives EV$, hohe FillP, niedrigen Spread, ausreichendes OI
 - ExitSlip ist realer Kostenblock und muss im Risiko genannt werden
 - Kein Trade wenn erwarteter Move Entry+Exit-Slippage+Theta+IV-Risiko nicht klar schlaegt
-- Chance/Risiko muss Entry, Break-even-Move, EV%, EV$, FillP und ExitSlip nennen
+- Chance/Risiko muss Entry, Break-even-Move, EV%, EV$, FillP, ExitSlip, IV/RV und falls vorhanden IVRank nennen
 
 EARNINGS / IV-CRUSH:
 - EARN_IV_OK=False ist harter Ausschluss fuer Long-Optionen
+- IVRank/IVPct aus eigener Journal-Historie: bei hohem Rank/Percentile ist Long-Option zu teuer
 - Wenn Earnings nahe und IV/RV unbekannt oder zu hoch: no_trade true
 - Earnings nicht nur als Score-Malus behandeln, sondern als Trade-Gate
 
@@ -246,9 +248,12 @@ def call_claude(summary: str, api_key: str, vix_direct=None) -> dict:
         raise ValueError("JSON Parse Fehler nach 4 Versuchen: " + str(last_error) +
                          " | Raw: " + text[:300])
 
-    is_valid, errors = validate_claude_output(result)
-    if not is_valid:
-        logger.warning("Claude-Output Schema-Fehler (werden korrigiert): %s", errors)
+    validated, errors = validate_report_payload(result)
+    if errors:
+        logger.error("Report-Pydantic-Schema-Guard: fail-closed: %s", errors[:5])
+        result = build_cancelled_report("; ".join(errors[:5]), raw=text)
+    else:
+        result = validated
 
     # Autoritativen VIX nutzen — nicht Claude-JSON-Feld
     authoritative_vix = vix_direct if vix_direct is not None else result.get("vix", "n/v")

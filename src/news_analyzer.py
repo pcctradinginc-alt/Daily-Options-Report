@@ -537,10 +537,196 @@ def format_clusters_for_claude(clusters: list) -> str:
     return "\n---\n".join(lines)
 
 
+def _canonical_signal_line(raw: str) -> str | None:
+    """
+    Macht Claude-Ausgaben robust.
+    Akzeptiert auch Markdown, Extra-Text, Spaces und leicht abweichende Trenner.
+    Gibt immer exakt das Repo-Format zurück:
+    TICKER_SIGNALS:TICKER:CALL|PUT:HIGH|MED|LOW:T1|T2|T3:21DTE,...
+    """
+    if not raw:
+        return None
+
+    text = raw.strip().replace("`", "")
+    text_upper = text.upper()
+
+    if "TICKER_SIGNALS:NONE" in text_upper or re.search(r"\bNO\s+VALID\s+SIGNALS\b", text_upper):
+        return "TICKER_SIGNALS:NONE"
+
+    pattern = re.compile(
+        r"\b([A-Z]{1,5})\s*[:|;,-]\s*"
+        r"(CALL|PUT)\s*[:|;,-]\s*"
+        r"(HIGH|MED|LOW|MEDIUM)\s*[:|;,-]\s*"
+        r"(T[123])\s*[:|;,-]\s*"
+        r"(\d{1,3})\s*DTE\b",
+        re.IGNORECASE,
+    )
+
+    found = []
+    seen = set()
+    for m in pattern.finditer(text):
+        ticker = m.group(1).upper()
+        direction = m.group(2).upper()
+        score = m.group(3).upper().replace("MEDIUM", "MED")
+        horizon = m.group(4).upper()
+        dte_days = int(m.group(5))
+        if ticker in seen or dte_days <= 0 or dte_days > 180:
+            continue
+        seen.add(ticker)
+        found.append(f"{ticker}:{direction}:{score}:{horizon}:{dte_days}DTE")
+
+    if found:
+        return "TICKER_SIGNALS:" + ",".join(found[:5])
+
+    # Häufige Claude-Variante: erste Zeile enthält TICKER_SIGNALS, aber mit Leerzeichen.
+    for line in text.splitlines():
+        if "TICKER_SIGNALS" in line.upper():
+            cleaned = re.sub(r"\s+", "", line.upper())
+            if cleaned.startswith("TICKER_SIGNALS:") and cleaned != "TICKER_SIGNALS:":
+                return cleaned
+
+    return None
+
+
+def _parse_cluster_text(cluster_text: str) -> list[dict]:
+    clusters = []
+    for block in cluster_text.split("---"):
+        block = block.strip()
+        if not block:
+            continue
+        row = {}
+        for part in block.split(" | "):
+            if ":" not in part:
+                continue
+            key, value = part.split(":", 1)
+            row[key.strip().upper()] = value.strip().strip('"')
+        if row:
+            clusters.append(row)
+    return clusters
+
+
+def _score_bucket(confidence: float) -> str:
+    if confidence >= 4.0:
+        return "HIGH"
+    if confidence >= 1.5:
+        return "MED"
+    return "LOW"
+
+
+def _infer_direction_from_cluster(ticker: str, event_type: str, headline: str, sentiment: float) -> str | None:
+    text = f"{event_type} {headline}".lower()
+    ticker = ticker.upper()
+
+    bearish_terms = (
+        "miss", "misses", "downgrade", "downgraded", "recall", "bankruptcy",
+        "default", "investigation", "warning", "guidance cut", "plunge",
+        "collapse", "layoffs", "fraud", "lawsuit", "probe", "tariff",
+        "trade war", "china risk", "recession", "crisis",
+    )
+    bullish_terms = (
+        "beat", "beats", "upgrade", "upgraded", "approval", "approved",
+        "fda", "merger", "acquisition", "buyback", "dividend", "record",
+        "outperform", "strong buy", "guidance raised", "deal", "contract",
+        "partnership", "ai deal", "insider buy",
+    )
+
+    # Makro-ETFs: klare Mapping-Regeln vor generischem Sentiment.
+    if ticker == "USO" and any(k in text for k in ("oil", "crude", "iran", "hormuz", "war", "sanction", "middle east")):
+        return "CALL"
+    if ticker == "GLD" and any(k in text for k in ("gold", "war", "iran", "hormuz", "crisis", "risk", "safe haven")):
+        return "CALL"
+    if ticker == "TLT" and any(k in text for k in ("fed cut", "rate cut", "recession", "growth scare")):
+        return "CALL"
+    if ticker == "TLT" and any(k in text for k in ("inflation", "hawkish", "yield spike", "tariff")):
+        return "PUT"
+    if ticker == "SPY" and any(k in text for k in ("tariff", "trade war", "china risk", "recession", "default", "crisis")):
+        return "PUT"
+
+    if any(k in text for k in bearish_terms):
+        return "PUT"
+    if any(k in text for k in bullish_terms):
+        return "CALL"
+
+    if sentiment <= -0.25:
+        return "PUT"
+    if sentiment >= 0.25:
+        return "CALL"
+
+    return None
+
+
+def _rule_based_signal_fallback(cluster_text: str) -> str:
+    """
+    Deterministischer Fallback, wenn Claude kein exakt parsebares Format liefert.
+    Ziel: kein leerer Tag wegen Format-Drift. Market/Options-Filter kommen danach weiterhin.
+    """
+    parsed = _parse_cluster_text(cluster_text)
+    candidates = []
+
+    macro_tickers = {"SPY", "QQQ", "TLT", "USO", "GLD", "UUP", "XLE", "XLF", "IWM"}
+
+    for c in parsed:
+        ticker = c.get("TICKER", "UNKNOWN").upper().strip()
+        if ticker == "UNKNOWN" or not re.fullmatch(r"[A-Z]{1,5}", ticker):
+            continue
+
+        try:
+            confidence = float(c.get("CONFIDENCE", "0"))
+            decay = float(c.get("DECAY", "0"))
+            earnings_penalty = float(c.get("EARNINGS_PENALTY", "1"))
+            sentiment = float(c.get("SENTIMENT", "0"))
+        except ValueError:
+            continue
+
+        if decay < 0.05 or confidence < 1.0 or earnings_penalty < 0.15:
+            continue
+
+        event_type = c.get("EVENT_TYPE", "general")
+        headline = c.get("HEADLINE", "")
+        direction = _infer_direction_from_cluster(ticker, event_type, headline, sentiment)
+        if not direction:
+            continue
+
+        is_macro = ticker in macro_tickers or any(
+            k in f"{event_type} {headline}".lower()
+            for k in ("fed", "oil", "gold", "iran", "hormuz", "war", "tariff", "trade war", "china")
+        )
+        horizon = "T3" if is_macro else "T1"
+        dte_days = 45 if is_macro else 21
+        score = _score_bucket(confidence)
+
+        candidates.append((confidence, ticker, direction, score, horizon, dte_days))
+
+    candidates.sort(reverse=True, key=lambda x: x[0])
+
+    seen = set()
+    parts = []
+    for _, ticker, direction, score, horizon, dte_days in candidates:
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        parts.append(f"{ticker}:{direction}:{score}:{horizon}:{dte_days}DTE")
+        if len(parts) >= 5:
+            break
+
+    if not parts:
+        return "TICKER_SIGNALS:NONE"
+
+    line = "TICKER_SIGNALS:" + ",".join(parts)
+    logger.info("Fallback-Signal: %s", line)
+    return line
+
+
 def run_claude(cluster_text: str, market_time: str, market_status: str,
                api_key: str, max_retries: int = 2) -> str:
     prompt = PROMPT.replace("{market_time}", market_time).replace(
         "{market_status}", market_status)
+
+    if not api_key:
+        logger.warning("ANTHROPIC_API_KEY fehlt — nutze deterministischen Fallback")
+        return _rule_based_signal_fallback(cluster_text)
+
+    last_raw = ""
     for attempt in range(max_retries):
         try:
             r = requests.post(
@@ -552,7 +738,8 @@ def run_claude(cluster_text: str, market_time: str, market_status: str,
                 },
                 json={
                     "model":      "claude-sonnet-4-6",
-                    "max_tokens": 200,
+                    "max_tokens": 260,
+                    "temperature": 0,
                     "system":     prompt,
                     "messages":   [{"role": "user",
                                     "content": "Cluster:\n" + cluster_text}],
@@ -563,24 +750,22 @@ def run_claude(cluster_text: str, market_time: str, market_status: str,
             resp = r.json()
             if "content" not in resp or not resp["content"]:
                 continue
-            raw = resp["content"][0]["text"].strip()
-            for line in raw.splitlines():
-                line = line.strip()
-                if line.startswith("TICKER_SIGNALS:"):
-                    signals = re.findall(
-                        r'([A-Z]{1,5}):(CALL|PUT):(HIGH|MED|LOW):(T1|T2|T3):(\d+DTE)',
-                        line
-                    )
-                    if signals or line == "TICKER_SIGNALS:NONE":
-                        logger.info("Claude Signal: %s", line)
-                        return line
+            raw = resp["content"][0].get("text", "").strip()
+            last_raw = raw
+            line = _canonical_signal_line(raw)
+            if line:
+                logger.info("Claude Signal: %s", line)
+                return line
+            logger.warning("Claude-Ausgabe nicht parsebar: %s", raw[:500])
         except (RequestException, Timeout) as e:
             logger.warning("Claude-Call Versuch %d: %s", attempt + 1, e)
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             logger.warning("Claude-Response Parse-Fehler: %s", e)
 
-    logger.warning("Keine validen Signale nach %d Versuchen", max_retries)
-    return "TICKER_SIGNALS:NONE"
+    logger.warning("Keine validen Claude-Signale nach %d Versuchen — nutze Fallback", max_retries)
+    if last_raw:
+        logger.debug("Letzte Claude-Rohantwort: %s", last_raw[:1000])
+    return _rule_based_signal_fallback(cluster_text)
 
 
 # ══════════════════════════════════════════════════════════

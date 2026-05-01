@@ -39,6 +39,7 @@ jobs:
           GMAIL_RECIPIENT:   ${{ secrets.GMAIL_RECIPIENT }}
           SMTP_SENDER:       ${{ secrets.SMTP_SENDER }}
           SMTP_PASSWORD:     ${{ secrets.SMTP_PASSWORD }}
+          TRADIER_SANDBOX:   "false"
         run: |
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             python src/main.py --dry-run --verbose

@@ -1,7 +1,7 @@
 """
 market_data.py — Marktdaten + Score-Berechnung (Step 2)
 
-v8 Rational-Gates:
+v10 Profit-Filter:
 - Tradier Production ist Standard; Sandbox nur explizit via TRADIER_SANDBOX=true.
 - Datenvalidator markiert kaputte Historien, Spikes und fehlende Volumendaten.
 - Markt-/Sektorfilter prüft SPY/QQQ/Sektor-ETF gegen das Einzeltitelsignal.
@@ -21,6 +21,7 @@ from requests.exceptions import RequestException, Timeout
 from rules import (
     RULES, check_liquidity, conservative_entry_price, estimate_fill_probability,
     exit_slippage_points, check_data_quality, check_earnings_iv_gate, merge_reasons,
+    build_time_stop_plan,
 )
 from market_calendar import market_elapsed_fraction
 from data_validator import (
@@ -535,7 +536,27 @@ def enrich_with_journal_iv_rank(symbol: str, option_ev: dict) -> dict:
     iv_rank = stats.get("iv_rank")
     iv_percentile = stats.get("iv_percentile")
 
-    # Hartes Gate erst bei ausreichend eigener Historie. Vorher nur Diagnose.
+    iv_to_rv = _safe_float(option_ev.get("iv_to_rv"), None)
+
+    # Cold Start: solange eigener IV-Rank noch nicht belastbar ist, blockiert IV/RV als Overpricing-Proxy.
+    if n < RULES.min_iv_history_samples_for_rank:
+        option_ev["iv_cold_start"] = True
+        if iv_to_rv is not None and iv_to_rv >= RULES.cold_start_iv_to_rv_hard_block:
+            option_ev["ev_ok"] = False
+            option_ev["ev_fail_reason"] = merge_reasons(
+                option_ev.get("ev_fail_reason"),
+                f"Cold-Start IV/RV {iv_to_rv:.2f} >= {RULES.cold_start_iv_to_rv_hard_block:.2f} Long-Option zu teuer",
+            )
+    else:
+        option_ev["iv_cold_start"] = False
+        if iv_to_rv is not None and iv_to_rv >= RULES.mature_iv_to_rv_hard_block:
+            option_ev["ev_ok"] = False
+            option_ev["ev_fail_reason"] = merge_reasons(
+                option_ev.get("ev_fail_reason"),
+                f"IV/RV {iv_to_rv:.2f} >= {RULES.mature_iv_to_rv_hard_block:.2f} Long-Option zu teuer",
+            )
+
+    # Eigener IV-Rank als hartes Gate erst bei ausreichend eigener Historie.
     if n >= RULES.min_iv_history_samples_for_rank:
         if iv_rank is not None and iv_rank >= RULES.iv_rank_hard_block_long:
             option_ev["ev_ok"] = False
@@ -637,6 +658,7 @@ def get_tradier_options(symbol, direction, tradier_token,
         best = sorted(chosen_pool, key=lambda c: c.get("ev_score", -999), reverse=True)[0]
         best["candidate_count"] = len(candidates)
         best["ev_candidates_ok"] = len(good)
+        best.update(build_time_stop_plan(direction, best.get("dte_actual")))
         best = enrich_with_journal_iv_rank(symbol, best)
         if not best.get("ev_ok") and not best.get("ev_fail_reason"):
             best["ev_fail_reason"] = "Kein Kandidat nach EV/Kosten/Earnings-Gates"
@@ -796,18 +818,29 @@ def process_ticker(ticker, direction, earnings_list, cfg,
         )), 2)
         score_reason = score_reason + "; sector=" + sector_result.severity + "; sent_price=" + sentiment_reaction.get("sentiment_price_label", "neutral")
 
-        options_data = get_tradier_options(
-            ticker, direction,
-            cfg.get("tradier_token", ""),
-            cfg.get("tradier_sandbox", False),
-            target_dte=target_dte,
-            underlying_price=price,
-            change_pct=change_pct,
-            closes=closes,
-            rel_vol=rel_vol,
-            signal_score=score,
-            earnings_soon=earnings_soon,
-        )
+        # Harte Snapshot-Konsistenz: Options-EV wird nur berechnet, wenn auch der
+        # Underlying-Snapshot aus Tradier Production/Sandbox stammt. Yahoo/AlphaVantage
+        # duerfen Research-Kontext liefern, aber keinen finalen Options-EV.
+        if RULES.require_tradier_quote_for_tradier_options and not str(quote_src).lower().startswith("tradier"):
+            options_data = {
+                "option_source": "tradier",
+                "ev_ok": False,
+                "ev_fail_reason": "Hard Block: Tradier-Optionen ohne Tradier-Underlying-Snapshot",
+                "snapshot_consistency_ok": False,
+            }
+        else:
+            options_data = get_tradier_options(
+                ticker, direction,
+                cfg.get("tradier_token", ""),
+                cfg.get("tradier_sandbox", False),
+                target_dte=target_dte,
+                underlying_price=price,
+                change_pct=change_pct,
+                closes=closes,
+                rel_vol=rel_vol,
+                signal_score=score,
+                earnings_soon=earnings_soon,
+            )
 
         market_stub = {"price": price, "_src_quote": quote_src, "quote_source": quote_src, "quote_age_seconds": quote_age_seconds}
         snapshot_ok, snapshot_reason = check_data_quality(market_stub, options_data)
@@ -861,6 +894,8 @@ def process_ticker(ticker, direction, earnings_list, cfg,
             "market_change_pct": sector_result.market_change_pct,
             "qqq_change_pct": sector_result.qqq_change_pct,
             "relative_to_sector_pct": sector_result.relative_to_sector_pct,
+            "sector_vs_market_pct": getattr(sector_result, "sector_vs_market_pct", None),
+            "sector_momentum_confirmation": getattr(sector_result, "momentum_confirmation", "neutral"),
             "sector_filter_ok": sector_result.ok,
             "sector_filter_reason": sector_result.reason,
             "sector_score_adjustment": sector_result.score_adjustment,
@@ -937,8 +972,9 @@ def build_summary(ranked, vix_value, ticker_directions,
     if failed:
         s += "API-FEHLER (Kurs=0): " + ", ".join(failed) + "\n"
 
-    s += "\nHARTE GATES: DATA_QUALITY_OK, LIQUIDITY_OK, EV_OK, EARNINGS_IV_OK muessen alle True sein.\n"
-    s += "SENTIMENT: nur Ranking-/Kontextinfo, kein EV-Retter.\n"
+    s += "\nHARTE GATES: Tradier-Snapshot, DATA_QUALITY_OK, LIQUIDITY_OK, EV_OK, EARNINGS_IV_OK, SECTOR_MARKET_OK muessen alle True sein.\n"
+    s += "SENTIMENT: nur Ranking-/Kontextinfo, kein EV-Retter. Final Decision sieht keine News-Texte.\n"
+    s += "SPREAD-REGIME: <=5% bevorzugt, 5-8% vorsichtig, 8-10% nur bei starkem EV, >10% harter Block.\n"
 
     s += "\nMARKTDATEN (sortiert nach Score):\n"
     s += (f"{'Ticker':<6} | {'Kurs':>7} | {'Δ%':>6} | {'MA50':>7} | "
@@ -952,7 +988,12 @@ def build_summary(ranked, vix_value, ticker_directions,
 
         news_flag = ("📈" if d["news_direction"] == "CALL" else "📉") + d["news_direction"]
         kurs_str = f"{d['price']:>7.2f}" if d["price"] > 0 else "   n/v!"
-        gate_ok = bool(d.get("_data_quality_ok")) and not d.get("_liquidity_fail") and bool(d.get("options", {}).get("ev_ok"))
+        gate_ok = (
+            bool(d.get("_data_quality_ok"))
+            and bool(d.get("sector_filter_ok", True))
+            and not d.get("_liquidity_fail")
+            and bool(d.get("options", {}).get("ev_ok"))
+        )
         gate_flag = "OK" if gate_ok else "FAIL"
 
         s += (f"{d['ticker']:<6} | {kurs_str} | {d['change_pct']:>6.2f}% | "
@@ -962,6 +1003,12 @@ def build_summary(ranked, vix_value, ticker_directions,
 
         if d.get("_no_trade_reason"):
             s += "  ⛔ NO_TRADE_REASON: " + d["_no_trade_reason"] + "\n"
+        s += ("  └─ SECTOR: ETF=" + str(d.get("sector_etf","n/v")) +
+              " | SectorΔ=" + str(d.get("sector_change_pct","n/v")) +
+              " | MarketΔ=" + str(d.get("market_change_pct","n/v")) +
+              " | RelSector=" + str(d.get("relative_to_sector_pct","n/v")) +
+              " | SectorVsMarket=" + str(d.get("sector_vs_market_pct","n/v")) +
+              " | Momentum=" + str(d.get("sector_momentum_confirmation","neutral")) + "\n")
 
         opt = d.get("options") or {}
         if opt:
@@ -978,6 +1025,8 @@ def build_summary(ranked, vix_value, ticker_directions,
                   " | IVRank=" + str(opt.get("iv_rank","n/v")) +
                   " | IVPct=" + str(opt.get("iv_percentile","n/v")) +
                   " | IVHist=" + str(opt.get("iv_history_count","n/v")) +
+                  " | IVCOLD=" + str(opt.get("iv_cold_start","n/v")) +
+                  " | TimeStop=" + str(opt.get("time_stop_hours","n/v")) + "h/" + str(opt.get("time_stop_required_move_pct","n/v")) + "%" +
                   " | OI=" + str(opt.get("open_interest","n/v")) +
                   " | FillP=" + str(opt.get("fill_probability","n/v")) +
                   " | EV%=" + str(opt.get("ev_pct","n/v")) +

@@ -1,14 +1,9 @@
 """
 main.py — Options Trading Bot
-Führt die vollständige Pipeline aus:
-  1. News-Analyse → Ticker-Signale
-  2. Marktdaten   → Score + Options-Greeks
-  3. Report       → HTML-Email
 
-Verwendung:
-    python src/main.py                   normaler Lauf
-    python src/main.py --dry-run         kein Email, Report als HTML gespeichert
-    python src/main.py --verbose         Details in der Konsole
+Fixes v2:
+- VIX direkt an apply_vix_rules() übergeben (Fix Nr. 1+2)
+- DTE aus Signal an process_ticker() übergeben (Fix Nr. 6)
 """
 
 import argparse
@@ -43,13 +38,11 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Options Trading Bot — täglicher Pipeline-Run"
-    )
+    parser = argparse.ArgumentParser(description="Options Trading Bot")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Kein Email-Versand — Report wird als report_preview.html gespeichert")
+                        help="Kein Email-Versand — Report als report_preview.html")
     parser.add_argument("--verbose", action="store_true",
-                        help="Detaillierte Ausgabe inkl. Cluster und Market Summary")
+                        help="Detaillierte Ausgabe")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
@@ -63,7 +56,7 @@ def main() -> int:
     t_start = time.monotonic()
 
     logger.info("=" * 50)
-    logger.info("  Options Trading Bot — %s", today)
+    logger.info("  Daily Options Report — %s", today)
     logger.info("=" * 50)
 
     # ══════════════════════════════════════════════════════
@@ -92,11 +85,11 @@ def main() -> int:
     )
     logger.info("  Signal: %s  (%.1fs)", ticker_signals, time.monotonic() - t1)
 
-    # VIX immer holen — wird auch für No-Trade Email benötigt
+    # Fix Nr. 1+2: VIX direkt holen — autoritativer Wert für apply_vix_rules()
     vix_value = get_vix()
     logger.info("  VIX: %s", vix_value)
 
-    # Kein Signal → No-Trade Email mit VIX + Top-Clustern
+    # Kein Signal → No-Trade Email
     if ticker_signals in ("TICKER_SIGNALS:NONE", ""):
         logger.info("Keine validen Signale heute")
         html    = _no_trade_html(today, vix_value, market_status, clusters[:3])
@@ -114,13 +107,18 @@ def main() -> int:
     parsed_signals = parse_ticker_signals(ticker_signals)
 
     if not parsed_signals:
-        logger.error("Keine gueltigen Ticker aus Signal geparst: %s", ticker_signals)
+        logger.error("Keine gueltigen Ticker geparst: %s", ticker_signals)
         return 1
 
-    ticker_directions: dict = {s["ticker"]: s["direction"] for s in parsed_signals}
-    tickers: list           = list(ticker_directions.keys())
+    ticker_directions = {s["ticker"]: s["direction"] for s in parsed_signals}
+    tickers           = list(ticker_directions.keys())
+
+    # Fix Nr. 6: DTE-Map aus Signal — wird an process_ticker() übergeben
+    dte_map = {s["ticker"]: s["dte_days"] for s in parsed_signals}
+
     logger.info("  Geparste Ticker: %s", ", ".join(
-        t + ":" + d for t, d in ticker_directions.items()
+        t + ":" + d + "(" + str(dte_map.get(t,21)) + "DTE)"
+        for t, d in ticker_directions.items()
     ))
 
     finnhub_key = cfg.get("finnhub_key","")
@@ -133,9 +131,11 @@ def main() -> int:
 
     logger.info("  VIX: %s | %d Ticker", vix_value, len(tickers))
 
+    # Fix Nr. 6: target_dte pro Ticker übergeben
     with ThreadPoolExecutor(max_workers=12) as ex:
         futures = {
-            ex.submit(process_ticker, t, ticker_directions[t], earnings_list, cfg): t
+            ex.submit(process_ticker, t, ticker_directions[t], earnings_list, cfg,
+                      dte_map.get(t, 21)): t
             for t in tickers
         }
         results = []
@@ -166,10 +166,13 @@ def main() -> int:
     t3 = time.monotonic()
 
     try:
-        data        = call_claude(market_summary, cfg.get("anthropic_api_key",""))
+        # Fix Nr. 1+2: vix_value direkt übergeben — nicht aus Claude-JSON lesen
+        data        = call_claude(market_summary, cfg.get("anthropic_api_key",""),
+                                  vix_direct=vix_value)
         html_report = build_html(data, today)
         no_trade    = data.get("no_trade", False)
         ticker      = data.get("ticker","")
+        direction   = ticker_directions.get(ticker, "CALL")
         subject     = (
             "⏸️ Daily Options Report – No Trade – " + today if no_trade
             else "📊 Daily Options Report – " + today + " · " + ticker
@@ -180,14 +183,14 @@ def main() -> int:
     except (ValueError, RuntimeError) as e:
         logger.error("Report-Fehler: %s", e)
         html_report = _error_html(str(e), today)
-        subject = "⚠️ Daily Options Report – Fehler – " + today
+        subject     = "⚠️ Daily Options Report – Fehler – " + today
 
     _send_or_save(html_report, subject, cfg, args.dry_run)
     logger.info("Fertig in %.1fs", time.monotonic() - t_start)
     return 0
 
 
-def _send_or_save(html: str, subject: str, cfg: dict, dry_run: bool) -> None:
+def _send_or_save(html, subject, cfg, dry_run):
     if dry_run:
         with open("report_preview.html", "w", encoding="utf-8") as f:
             f.write(html)
@@ -196,8 +199,7 @@ def _send_or_save(html: str, subject: str, cfg: dict, dry_run: bool) -> None:
         send_email(subject, html, cfg)
 
 
-def _no_trade_html(today: str, vix=None, market_status: str = "",
-                   clusters: list = None) -> str:
+def _no_trade_html(today, vix=None, market_status="", clusters=None):
     vix_str    = str(vix) if vix and vix != "n/v" else "n/v"
     status_str = market_status or "unbekannt"
     clusters   = clusters or []
@@ -231,9 +233,7 @@ def _no_trade_html(today: str, vix=None, market_status: str = "",
             '<th style="padding:4px 8px;font-size:10px;color:#86868b;">Conf</th>'
             '<th style="padding:4px 8px;font-size:10px;color:#86868b;">Sent</th>'
             '<th style="padding:4px 8px;font-size:10px;color:#86868b;text-align:left;">Headline</th>'
-            '</tr>'
-            + cluster_rows +
-            '</table></div>'
+            '</tr>' + cluster_rows + '</table></div>'
         )
 
     return (
@@ -244,53 +244,42 @@ def _no_trade_html(today: str, vix=None, market_status: str = "",
         '<div style="max-width:520px;margin:0 auto;padding:32px 16px;">'
         '<div style="background:white;border-radius:18px;padding:32px;'
         'box-shadow:0 2px 12px rgba(0,0,0,0.07);">'
-
-        # Header
         '<div style="text-align:center;margin-bottom:24px;">'
         '<div style="font-size:48px;margin-bottom:12px;">⏸️</div>'
         '<h2 style="color:#1d1d1f;margin:0 0 6px 0;font-size:22px;font-weight:700;">'
-        'Heute kein Trade</h2>'
+        'Daily Options Report</h2>'
+        '<h3 style="color:#ff3b30;margin:0 0 6px 0;font-size:16px;font-weight:600;">'
+        'Heute kein Trade</h3>'
         f'<p style="color:#86868b;font-size:13px;margin:0;">{today}</p>'
         '</div>'
-
-        # Statuszeilen
         '<div style="border-top:1px solid #e5e5ea;padding-top:4px;">'
-
         '<div style="display:flex;justify-content:space-between;align-items:center;'
         'padding:10px 0;border-bottom:1px solid #e5e5ea;">'
         '<span style="font-size:14px;color:#86868b;">VIX</span>'
         f'<span style="font-size:14px;font-weight:600;color:#1d1d1f;">{vix_str}</span>'
         '</div>'
-
         '<div style="display:flex;justify-content:space-between;align-items:center;'
         'padding:10px 0;border-bottom:1px solid #e5e5ea;">'
         '<span style="font-size:14px;color:#86868b;">Markt</span>'
         f'<span style="font-size:14px;font-weight:600;color:#1d1d1f;">{status_str}</span>'
         '</div>'
-
         '<div style="display:flex;justify-content:space-between;align-items:center;'
         'padding:10px 0;">'
         '<span style="font-size:14px;color:#86868b;">Grund</span>'
         '<span style="font-size:14px;color:#1d1d1f;">Kein valides Signal</span>'
         '</div>'
-
         '</div>'
-
-        # Top Cluster
         + cluster_section +
-
-        # Footer
         '<div style="margin-top:20px;background:#f5f5f7;border-radius:12px;'
         'padding:14px;text-align:center;">'
         '<p style="margin:0;font-size:12px;color:#86868b;">'
         'Morgen läuft die Analyse erneut automatisch.</p>'
         '</div>'
-
         '</div></div></body></html>'
     )
 
 
-def _error_html(error: str, today: str) -> str:
+def _error_html(error, today):
     return (
         '<html><head><meta charset="UTF-8"></head>'
         '<body style="font-family:-apple-system,sans-serif;background:#f5f5f7;'
@@ -298,7 +287,7 @@ def _error_html(error: str, today: str) -> str:
         '<div style="background:white;border-radius:18px;padding:32px;'
         'max-width:400px;margin:0 auto;">'
         '<div style="font-size:40px;margin-bottom:16px;">⚠️</div>'
-        '<h2 style="color:#1d1d1f;margin:0 0 8px 0;">Fehler</h2>'
+        '<h2 style="color:#1d1d1f;margin:0 0 8px 0;">Daily Options Report — Fehler</h2>'
         f'<p style="color:#86868b;font-size:14px;">{error}</p>'
         '</div></body></html>'
     )

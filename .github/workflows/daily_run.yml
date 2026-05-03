@@ -2,8 +2,8 @@ name: Daily Options Report
 
 on:
   schedule:
-    # GitHub cron ist UTC und kennt keine US-DST. Zwei Slots vermeiden 09:30-ET-Fehler.
-    - cron: '30 14 * 3-10 1-5'  # ca. 10:30 ET waehrend US-DST
+    # GitHub cron ist UTC und kennt keine US-DST.
+    - cron: '30 14 * 3-10 1-5'       # ca. 10:30 ET waehrend US-DST
     - cron: '30 15 * 1,2,11,12 1-5'  # ca. 10:30 ET Standardzeit
 
   workflow_dispatch:
@@ -14,6 +14,10 @@ on:
         default: 'false'
         type: choice
         options: ['false', 'true']
+
+concurrency:
+  group: daily-options-report-journal
+  cancel-in-progress: false
 
 jobs:
   run-bot:
@@ -29,28 +33,32 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Dependencies installieren
-        run: pip install -r requirements.txt
+      - name: data-Ordner sicherstellen
+        run: mkdir -p data
 
       - name: Journal-Cache wiederherstellen
-        uses: actions/cache@v4
+        id: journal-cache
+        uses: actions/cache/restore@v4
         with:
-          path: data
-          key: trading-journal-${{ github.run_id }}
+          path: data/trading_journal.sqlite
+          key: trading-journal-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            trading-journal-
+            trading-journal-${{ runner.os }}-
+
+      - name: Dependencies installieren
+        run: pip install -r requirements.txt
 
       - name: Bot ausführen
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TRADIER_TOKEN:     ${{ secrets.TRADIER_TOKEN }}
+          TRADIER_SANDBOX:   "false"
           FINNHUB_KEY:       ${{ secrets.FINNHUB_KEY }}
           ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
           GMAIL_RECIPIENT:   ${{ secrets.GMAIL_RECIPIENT }}
           SMTP_SENDER:       ${{ secrets.SMTP_SENDER }}
           SMTP_PASSWORD:     ${{ secrets.SMTP_PASSWORD }}
           SEC_USER_AGENT:    ${{ secrets.SEC_USER_AGENT }}
-          TRADIER_SANDBOX:   "false"
         run: |
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             python src/main.py --dry-run --verbose
@@ -58,17 +66,27 @@ jobs:
             python src/main.py --verbose
           fi
 
-      - name: Report-Preview speichern (bei Dry-run)
-        if: github.event.inputs.dry_run == 'true'
-        uses: actions/upload-artifact@v4
+      - name: Journal-Cache speichern
+        if: always() && hashFiles('data/trading_journal.sqlite') != ''
+        uses: actions/cache/save@v4
         with:
-          name: report-preview
-          path: report_preview.html
-          retention-days: 7
-      - name: Journal speichern
+          path: data/trading_journal.sqlite
+          key: trading-journal-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Journal als Artifact sichern
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trading-journal
-          path: data/
-          retention-days: 30
+          name: trading-journal-${{ github.run_number }}
+          path: data/trading_journal.sqlite
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Report-Preview speichern
+        if: github.event.inputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-preview-${{ github.run_number }}
+          path: report_preview.html
+          retention-days: 7
+          if-no-files-found: ignore

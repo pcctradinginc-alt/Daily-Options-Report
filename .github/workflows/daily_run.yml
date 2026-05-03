@@ -2,9 +2,8 @@ name: Daily Options Report
 
 on:
   schedule:
-    # GitHub cron ist UTC und kennt keine US-DST.
-    - cron: '30 14 * 3-10 1-5'       # ca. 10:30 ET waehrend US-DST
-    - cron: '30 15 * 1,2,11,12 1-5'  # ca. 10:30 ET Standardzeit
+    # ca. 11:45 ET (15:45 UTC) — Mo–Fr
+    - cron: '45 15 * * 1-5'
 
   workflow_dispatch:
     inputs:
@@ -16,7 +15,7 @@ on:
         options: ['false', 'true']
 
 concurrency:
-  group: daily-options-report-journal
+  group: daily-options-report
   cancel-in-progress: false
 
 jobs:
@@ -24,19 +23,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Python einrichten
+      - name: Python 3.11 einrichten
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: data-Ordner sicherstellen
+      - name: data-Ordner erstellen
         run: mkdir -p data
 
-      - name: Journal-Cache wiederherstellen
+      - name: Trading Journal aus Cache laden
         id: journal-cache
         uses: actions/cache/restore@v4
         with:
@@ -46,7 +45,9 @@ jobs:
             trading-journal-${{ runner.os }}-
 
       - name: Dependencies installieren
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Bot ausführen
         env:
@@ -66,7 +67,7 @@ jobs:
             python src/main.py --verbose
           fi
 
-      - name: Journal-Cache speichern
+      - name: Trading Journal zurück in Cache speichern
         if: always() && hashFiles('data/trading_journal.sqlite') != ''
         uses: actions/cache/save@v4
         with:
@@ -80,13 +81,3 @@ jobs:
           name: trading-journal-${{ github.run_number }}
           path: data/trading_journal.sqlite
           retention-days: 90
-          if-no-files-found: ignore
-
-      - name: Report-Preview speichern
-        if: github.event.inputs.dry_run == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: report-preview-${{ github.run_number }}
-          path: report_preview.html
-          retention-days: 7
-          if-no-files-found: ignore

@@ -237,9 +237,17 @@ _NAME_BLOCKLIST = {
     "energy", "tech", "financial", "industrial", "consumer",
     "media", "data", "research", "services", "solutions",
     "systems", "products", "technologies", "innovations",
+    # Rohstoff-Begriffe — Headlines über Preise, nicht über die Firmen
+    "coffee", "cocoa", "wheat", "corn", "oil", "gold", "silver",
+    "copper", "platinum", "uranium", "lithium", "nickel",
+    "natural gas", "crude",
     # Investment-Vokabular
     "capital", "equity", "fund", "income", "growth", "value",
     "dividend", "premium", "core", "alpha", "beta",
+    # Generische Akronyme — meinen in Headlines fast immer das Konzept,
+    # nicht den gleichnamigen Ticker (z.B. "AI" statt C3.ai)
+    "ai", "it", "ip", "ev", "ceo", "cfo", "cto", "ipo",
+    "api", "saas", "esg", "ar", "vr", "ml",
 }
 
 # Modul-weiter Cache, vermeidet wiederholtes Parsen der SEC-Datei

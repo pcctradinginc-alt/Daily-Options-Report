@@ -10,6 +10,8 @@ Ziel:
 - Form 4 differenzierter: Kauf != Award != Optionsausübung != Steuerverkauf.
 - 8-K nach Items/Keywords klassifizieren.
 - Fail-safe: bei Fehler neutral.
+- Bonus: get_company_name_to_ticker() liefert Name->Ticker-Mapping
+  für News-Headline-Auflösung (z.B. "Apple reports..." -> "AAPL").
 """
 
 from __future__ import annotations
@@ -80,6 +82,98 @@ EMPTY_RESULT = {
     "events": [],
 }
 
+# ==================== NAME → TICKER MAPPING (Konstanten) ====================
+
+# Suffixe, die beim Normalisieren von Firmennamen entfernt werden
+_CORP_SUFFIXES = {
+    "inc", "corp", "corporation", "incorporated", "co", "company",
+    "ltd", "limited", "llc", "plc", "lp", "lllp",
+    "holdings", "holding", "group", "trust",
+    "sa", "ag", "nv", "bv", "spa", "kgaa",
+    "common", "stock", "ordinary", "shares",
+    "class", "a", "b", "c", "adr", "ads",
+    "the",
+}
+
+# Hand-kuratierte Aliase haben Vorrang vor der SEC-Map.
+# Hier landen Marketing-Namen ("Google" statt "Alphabet"), Klassenwahl
+# (BRK.B liquider als BRK.A) und alte Firmennamen ("Facebook" -> META).
+COMPANY_NAME_OVERRIDES = {
+    "alphabet": "GOOGL",
+    "google": "GOOGL",
+    "meta platforms": "META",
+    "meta": "META",
+    "facebook": "META",
+    "berkshire hathaway": "BRK.B",
+    "berkshire": "BRK.B",
+    "apple": "AAPL",
+    "microsoft": "MSFT",
+    "amazon": "AMZN",
+    "nvidia": "NVDA",
+    "tesla": "TSLA",
+    "netflix": "NFLX",
+    "jpmorgan": "JPM",
+    "jp morgan": "JPM",
+    "jpmorgan chase": "JPM",
+    "goldman sachs": "GS",
+    "morgan stanley": "MS",
+    "bank of america": "BAC",
+    "wells fargo": "WFC",
+    "citigroup": "C",
+    "exxon": "XOM",
+    "exxon mobil": "XOM",
+    "exxonmobil": "XOM",
+    "chevron": "CVX",
+    "walmart": "WMT",
+    "coca cola": "KO",
+    "coca-cola": "KO",
+    "pepsi": "PEP",
+    "pepsico": "PEP",
+    "visa": "V",
+    "mastercard": "MA",
+    "palantir": "PLTR",
+    "advanced micro devices": "AMD",
+    "amd": "AMD",
+    "intel": "INTC",
+    "broadcom": "AVGO",
+    "taiwan semiconductor": "TSM",
+    "tsmc": "TSM",
+    "boeing": "BA",
+    "lockheed martin": "LMT",
+    "raytheon": "RTX",
+    "pfizer": "PFE",
+    "eli lilly": "LLY",
+    "johnson and johnson": "JNJ",   # nach &-Normalisierung
+    "merck": "MRK",
+    "unitedhealth": "UNH",
+    "disney": "DIS",
+    "walt disney": "DIS",
+    "starbucks": "SBUX",
+    "mcdonalds": "MCD",
+    "uber": "UBER",
+    "airbnb": "ABNB",
+    "salesforce": "CRM",
+    "oracle": "ORCL",
+    "adobe": "ADBE",
+    "qualcomm": "QCOM",
+    "at and t": "T",                # nach &-Normalisierung
+    "procter and gamble": "PG",     # nach &-Normalisierung
+    "home depot": "HD",
+    "costco": "COST",
+    "nike": "NKE",
+}
+
+# Generische Wörter, die als Firmenname zu False-Positives führen
+_NAME_BLOCKLIST = {
+    "global", "international", "american", "national", "general",
+    "first", "new", "us", "usa", "the", "and", "of",
+    "block", "match", "snap", "square",  # zu generisch trotz echter Ticker
+    "trade", "world", "city", "state", "united",
+}
+
+# Modul-weiter Cache, vermeidet wiederholtes Parsen der SEC-Datei
+_cached_name_map: dict[str, str] | None = None
+
 
 def _headers() -> dict:
     # Kein manueller Host-Header: derselbe Helper wird fuer www.sec.gov
@@ -111,20 +205,29 @@ def _get_text(url: str) -> str:
     return r.text
 
 
-def _load_ticker_map() -> dict[str, int]:
+def _load_sec_raw_tickers() -> dict:
+    """Lädt company_tickers.json (mit 7-Tage-Cache). Zentrale Helper-Funktion,
+    damit _load_ticker_map und get_company_name_to_ticker dieselbe Logik nutzen.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        if CIK_CACHE.exists():
-            age = datetime.now(timezone.utc) - datetime.fromtimestamp(CIK_CACHE.stat().st_mtime, tz=timezone.utc)
-            if age.days < 7:
-                raw = json.loads(CIK_CACHE.read_text(encoding="utf-8"))
-                return {v["ticker"].upper(): int(v["cik_str"]) for v in raw.values()}
-    except Exception:
-        pass
+    if CIK_CACHE.exists():
+        age = datetime.now(timezone.utc) - datetime.fromtimestamp(
+            CIK_CACHE.stat().st_mtime, tz=timezone.utc)
+        if age.days < 7:
+            return json.loads(CIK_CACHE.read_text(encoding="utf-8"))
 
     raw = _get_json("https://www.sec.gov/files/company_tickers.json")
     CIK_CACHE.write_text(json.dumps(raw), encoding="utf-8")
-    return {v["ticker"].upper(): int(v["cik_str"]) for v in raw.values()}
+    return raw
+
+
+def _load_ticker_map() -> dict[str, int]:
+    try:
+        raw = _load_sec_raw_tickers()
+        return {v["ticker"].upper(): int(v["cik_str"]) for v in raw.values()}
+    except Exception as e:
+        logger.warning("Ticker-Map konnte nicht geladen werden: %s", e)
+        return {}
 
 
 def _filing_url(cik: int, accession: str, primary_doc: str) -> str:
@@ -312,3 +415,64 @@ def get_sec_signal(ticker: str, days_back: int = 14) -> dict:
     except Exception as e:
         logger.warning("SEC-Check %s fehlgeschlagen: %s", ticker, e)
         return {**EMPTY_RESULT, "reason": f"SEC-Fehler: {str(e)[:60]}"}
+
+
+# ==================== NAME → TICKER MAPPING (Funktionen) ====================
+
+def _normalize_company_name(name: str) -> str:
+    """'Apple Inc.' -> 'apple'
+       'BERKSHIRE HATHAWAY INC /DE/' -> 'berkshire hathaway'
+       'AT&T INC' -> 'at and t'
+       'Johnson & Johnson' -> 'johnson and johnson'
+    """
+    s = name.lower()
+    s = s.replace("&", " and ")                 # AT&T -> at and t
+    s = re.sub(r"/[a-z]{2,3}/", " ", s)         # /DE/, /MD/, /NY/ Suffixe
+    s = re.sub(r"[^a-z0-9\s\-]", " ", s)        # Punkte, Kommas raus
+    s = re.sub(r"\s+", " ", s).strip()
+    tokens = s.split()
+    # Suffix-Tokens am Ende abschneiden, solange welche da sind
+    while tokens and tokens[-1] in _CORP_SUFFIXES:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def get_company_name_to_ticker() -> dict[str, str]:
+    """Liefert Mapping 'apple' -> 'AAPL', 'microsoft' -> 'MSFT', etc.
+
+    Quelle: bereits gecachte SEC-Datei sec_company_tickers.json + Overrides.
+    Bei Konflikt gewinnt der Override. Bei doppelten SEC-Einträgen mit
+    gleichem normalisierten Namen gewinnt der erste (= meist die Haupt-Aktienklasse).
+
+    Modul-weiter Cache verhindert mehrfaches Parsen der ~1 MB SEC-Datei.
+    """
+    global _cached_name_map
+    if _cached_name_map is not None:
+        return _cached_name_map
+
+    name_map: dict[str, str] = {}
+
+    try:
+        raw = _load_sec_raw_tickers()
+        for v in raw.values():
+            ticker = (v.get("ticker") or "").upper().strip()
+            title = (v.get("title") or "").strip()
+            if not ticker or not title:
+                continue
+            normalized = _normalize_company_name(title)
+            if not normalized or len(normalized) < 4:
+                continue
+            if normalized in _NAME_BLOCKLIST:
+                continue
+            # Erster gewinnt (vermeidet, dass z.B. BRK.A später BRK.B überschreibt)
+            if normalized not in name_map:
+                name_map[normalized] = ticker
+    except Exception as e:
+        logger.warning("SEC Name-Map konnte nicht geladen werden: %s", e)
+
+    # Overrides drüberlegen — die haben immer Vorrang
+    name_map.update(COMPANY_NAME_OVERRIDES)
+
+    _cached_name_map = name_map
+    logger.info("Name->Ticker Mapping: %d Einträge geladen", len(name_map))
+    return name_map

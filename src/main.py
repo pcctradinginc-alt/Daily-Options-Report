@@ -125,6 +125,24 @@ def main() -> int:
     articles = fetch_all_feeds()
     earnings_map = build_earnings_map(cfg.get("finnhub_key", ""))
     clusters = cluster_articles(articles, earnings_map)
+
+    # Diagnostik: was hat die Ticker-Auflösung gefunden?
+    logger.info("Nach Ticker-Filterung: %d Cluster übrig (von %d Artikeln)",
+                len(clusters), len(articles))
+    if clusters:
+        top = sorted(clusters, key=lambda c: c.get("confidence_score", 0),
+                     reverse=True)[:5]
+        for c in top:
+            logger.info("  → %s (conf=%.1f, %s): %s",
+                        c["ticker"], c["confidence_score"],
+                        c["event_type"], c["headline_repr"][:80])
+    else:
+        # Wenn 0 Cluster: zeige ein paar Original-Headlines, damit man sieht,
+        # was die Resolver-Logik nicht gematcht hat
+        logger.info("Keine Cluster — Beispiel-Headlines, die nicht gematcht wurden:")
+        for art in articles[:5]:
+            logger.info("  ✗ %s", art.get("title", "")[:100])
+
     cluster_text = format_clusters_for_claude(clusters)
     market_time, market_status = get_market_context()
 

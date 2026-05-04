@@ -97,21 +97,54 @@ _CORP_SUFFIXES = {
 
 # Hand-kuratierte Aliase haben Vorrang vor der SEC-Map.
 # Hier landen Marketing-Namen ("Google" statt "Alphabet"), Klassenwahl
-# (BRK.B liquider als BRK.A) und alte Firmennamen ("Facebook" -> META).
+# (BRK.B liquider als BRK.A), alte Firmennamen ("Facebook" -> META) und
+# "Rettungsanker" für kurze Ticker oder Ein-Buchstaben-Symbole, die sonst
+# durch die Sicherheitsregeln im Resolver fallen würden.
 COMPANY_NAME_OVERRIDES = {
+    # --- TECH & GROWTH ---
     "alphabet": "GOOGL",
     "google": "GOOGL",
     "meta platforms": "META",
     "meta": "META",
     "facebook": "META",
-    "berkshire hathaway": "BRK.B",
-    "berkshire": "BRK.B",
     "apple": "AAPL",
     "microsoft": "MSFT",
     "amazon": "AMZN",
     "nvidia": "NVDA",
     "tesla": "TSLA",
     "netflix": "NFLX",
+    "salesforce": "CRM",
+    "oracle": "ORCL",
+    "adobe": "ADBE",
+    "palantir": "PLTR",
+    "shopify": "SHOP",
+    "spotify": "SPOT",
+    "uber": "UBER",
+    "airbnb": "ABNB",
+    "lyft": "LYFT",
+    "doordash": "DASH",
+    "door dash": "DASH",
+    "super micro": "SMCI",
+    "supermicro": "SMCI",
+    "snowflake": "SNOW",
+    "crowdstrike": "CRWD",
+    "palo alto networks": "PANW",
+
+    # --- CHIPS & HARDWARE ---
+    "advanced micro devices": "AMD",
+    "amd": "AMD",
+    "intel": "INTC",
+    "broadcom": "AVGO",
+    "qualcomm": "QCOM",
+    "taiwan semiconductor": "TSM",
+    "tsmc": "TSM",
+    "asml": "ASML",
+    "arm holdings": "ARM",
+    "applied materials": "AMAT",
+    "ibm": "IBM",
+    "dell": "DELL",
+
+    # --- FINANCE ---
     "jpmorgan": "JPM",
     "jp morgan": "JPM",
     "jpmorgan chase": "JPM",
@@ -119,49 +152,73 @@ COMPANY_NAME_OVERRIDES = {
     "morgan stanley": "MS",
     "bank of america": "BAC",
     "wells fargo": "WFC",
-    "citigroup": "C",
-    "exxon": "XOM",
-    "exxon mobil": "XOM",
-    "exxonmobil": "XOM",
-    "chevron": "CVX",
+    "citigroup": "C",            # 1-Buchstabe-Ticker, Override-Privileg
+    "visa": "V",                 # 1-Buchstabe-Ticker, Override-Privileg
+    "mastercard": "MA",
+    "paypal": "PYPL",
+    "robinhood": "HOOD",
+    "coinbase": "COIN",
+    "blackrock": "BLK",
+    "charles schwab": "SCHW",
+
+    # --- RETAIL & CONSUMER ---
     "walmart": "WMT",
+    "costco": "COST",
+    "home depot": "HD",
+    "lowes": "LOW",
+    "nike": "NKE",
+    "starbucks": "SBUX",
+    "mcdonalds": "MCD",
     "coca cola": "KO",
     "coca-cola": "KO",
     "pepsi": "PEP",
     "pepsico": "PEP",
-    "visa": "V",
-    "mastercard": "MA",
-    "palantir": "PLTR",
-    "advanced micro devices": "AMD",
-    "amd": "AMD",
-    "intel": "INTC",
-    "broadcom": "AVGO",
-    "taiwan semiconductor": "TSM",
-    "tsmc": "TSM",
+    "procter and gamble": "PG",  # nach &-Normalisierung
+    "p and g": "PG",
+    "estee lauder": "EL",
+    "lululemon": "LULU",
+    "ford": "F",                 # 1-Buchstabe-Ticker, Override-Privileg
+    "general motors": "GM",
+    "ebay": "EBAY",
+
+    # --- ENERGY & INDUSTRIAL ---
+    "exxon": "XOM",
+    "exxon mobil": "XOM",
+    "exxonmobil": "XOM",
+    "chevron": "CVX",
+    "shell": "SHEL",
     "boeing": "BA",
     "lockheed martin": "LMT",
     "raytheon": "RTX",
+    "general electric": "GE",
+    "ge aerospace": "GE",
+    "ge healthcare": "GEHC",
+    "ge vernova": "GEV",
+    "caterpillar": "CAT",
+
+    # --- HEALTHCARE & PHARMA ---
     "pfizer": "PFE",
     "eli lilly": "LLY",
-    "johnson and johnson": "JNJ",   # nach &-Normalisierung
+    "johnson and johnson": "JNJ",  # nach &-Normalisierung
+    "j and j": "JNJ",
     "merck": "MRK",
     "unitedhealth": "UNH",
     "cigna": "CI",
+    "moderna": "MRNA",
+    "abbvie": "ABBV",
+    "amgen": "AMGN",
+    "gilead": "GILD",
+    "astrazeneca": "AZN",
+    "novo nordisk": "NVO",
+
+    # --- TELECOM, MEDIA, SPECIALS ---
     "disney": "DIS",
     "walt disney": "DIS",
-    "starbucks": "SBUX",
-    "mcdonalds": "MCD",
-    "uber": "UBER",
-    "airbnb": "ABNB",
-    "salesforce": "CRM",
-    "oracle": "ORCL",
-    "adobe": "ADBE",
-    "qualcomm": "QCOM",
-    "at and t": "T",                # nach &-Normalisierung
-    "procter and gamble": "PG",     # nach &-Normalisierung
-    "home depot": "HD",
-    "costco": "COST",
-    "nike": "NKE",
+    "at and t": "T",             # nach &-Normalisierung
+    "verizon": "VZ",
+    "t-mobile": "TMUS",
+    "berkshire hathaway": "BRK.B",
+    "berkshire": "BRK.B",
 }
 
 # Generische Wörter, die als Firmenname zu False-Positives führen.
@@ -174,7 +231,7 @@ _NAME_BLOCKLIST = {
     # Penny-Stock-Falle: Ticker existiert, Wort ist aber zu häufig
     "block", "match", "snap", "square", "trade", "city", "state",
     "here", "there", "this", "that", "them",
-    "viking", "emerging",
+    "viking", "emerging", "target",
     # Sektor-/Branchenwörter, die News oft enthalten
     "strategy",  # MSTR seit Umbenennung von MicroStrategy
     "energy", "tech", "financial", "industrial", "consumer",

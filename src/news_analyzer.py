@@ -34,6 +34,15 @@ except ImportError:
 _KNOWN_TICKERS_CACHE: set[str] | None = None
 _NAME_TO_TICKER_CACHE: dict[str, str] | None = None
 
+# Generische Akronyme, die in Headlines fast immer das Konzept meinen,
+# nicht den gleichnamigen Ticker. AI matcht z.B. C3.ai (Ticker: AI),
+# obwohl die Headline über künstliche Intelligenz im Allgemeinen geht.
+_GENERIC_ACRONYMS = {
+    "AI", "IT", "IP", "EV", "CEO", "CFO", "CTO", "IPO",
+    "API", "SAAS", "ESG", "AR", "VR", "ML",
+    "USA", "GDP", "FED", "ETF", "REIT", "SPAC",
+}
+
 logger = logging.getLogger(__name__)
 
 # ==================== RSS FEEDS ====================
@@ -171,19 +180,23 @@ def _resolve_ticker_from_headline(
     """Versucht, einen Ticker aus der Headline zu extrahieren.
     Reihenfolge: 1) direkter Ticker im Originaltext, 2) Firmenname.
 
-    Anti-False-Positive-Regeln für Firmennamen-Match:
-      - Match muss im handelbaren Ticker-Universum sein,
+    Anti-False-Positive-Regeln:
+      - Generische Akronyme (AI, IT, IPO, ...) werden ignoriert,
+        auch wenn ein gleichnamiger Ticker existiert.
+      - Firmennamen-Match muss im handelbaren Universe sein,
         außer er stammt aus der hand-kuratierten Override-Liste.
       - Einwort-Firmennamen müssen mindestens 5 Buchstaben haben,
         sonst zu generisch (z.B. 'vik' für Viking Holdings).
     """
-    # 1) Direkter Ticker — im Originaltext groß geschrieben
+    # 1) Direkter Ticker — im Originaltext groß geschrieben.
+    # Generische Akronyme ausschließen, auch wenn der Ticker existiert.
     for word in title.split():
         clean = word.strip(".,:;()[]{}'\"")
         if (clean.isupper()
                 and 2 <= len(clean) <= 5
                 and clean.isalpha()
                 and clean in known_tickers
+                and clean not in _GENERIC_ACRONYMS
                 and clean not in seen):
             return clean
 

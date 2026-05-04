@@ -16,6 +16,16 @@ try:
 except ImportError:
     get_finbert_sentiment_batch = None
 
+# Handelbares Ticker-Universum (Nasdaq + ETFs) für Validierung der News-Ticker
+try:
+    from universe import get_known_tickers, STATIC_ETFS
+except ImportError:
+    get_known_tickers = None
+    STATIC_ETFS = {"SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "USO", "TLT"}
+
+# Wird beim ersten Aufruf von cluster_articles() gefüllt (Lazy-Load)
+_KNOWN_TICKERS_CACHE: set[str] | None = None
+
 logger = logging.getLogger(__name__)
 
 # ==================== RSS FEEDS ====================
@@ -66,8 +76,9 @@ def fetch_all_feeds() -> List[Dict]:
                 })
         except Exception as e:
             logger.debug("Feed-Fehler %s: %s", url[:50], e)
-    logger.info("%d Artikel aus %d Feeds geladen[cite: 1]", len(articles), len(RSS_FEEDS))
+    logger.info("%d Artikel aus %d Feeds geladen", len(articles), len(RSS_FEEDS))
     return articles
+
 
 def build_earnings_map(finnhub_key: str) -> Dict[str, bool]:
     """Prüft anstehende Earnings über Finnhub."""
@@ -76,7 +87,7 @@ def build_earnings_map(finnhub_key: str) -> Dict[str, bool]:
     try:
         today = datetime.now().strftime("%Y-%m-%d")
         end = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-        
+
         r = requests.get(
             "https://finnhub.io/api/v1/calendar/earnings",
             params={"from": today, "to": end, "token": finnhub_key},
@@ -86,14 +97,15 @@ def build_earnings_map(finnhub_key: str) -> Dict[str, bool]:
             symbols = [e.get("symbol") for e in r.json().get("earningsCalendar", []) if e.get("symbol")]
             return {sym.upper(): True for sym in symbols}
     except Exception as e:
-        logger.warning("Earnings-Map Fehler: %s[cite: 1]", e)
+        logger.warning("Earnings-Map Fehler: %s", e)
     return {}
+
 
 def format_clusters_for_claude(clusters: List[Dict]) -> str:
     """Wandelt Cluster-Daten in Text für das LLM um."""
     if not clusters:
-        return "Keine relevanten Cluster heute.[cite: 1]"
-    
+        return "Keine relevanten Cluster heute."
+
     lines = ["Aktuelle relevante Cluster:"]
     for c in clusters[:12]:
         lines.append(
@@ -105,41 +117,80 @@ def format_clusters_for_claude(clusters: List[Dict]) -> str:
         )
     return "\n".join(lines)
 
+
+def _load_known_tickers() -> set[str]:
+    """Lädt das Ticker-Universum genau einmal pro Run (Lazy + Cache)."""
+    global _KNOWN_TICKERS_CACHE
+    if _KNOWN_TICKERS_CACHE is not None:
+        return _KNOWN_TICKERS_CACHE
+
+    if get_known_tickers is not None:
+        try:
+            _KNOWN_TICKERS_CACHE = get_known_tickers(fallback=STATIC_ETFS)
+            logger.info("Ticker-Universum geladen: %d Symbole", len(_KNOWN_TICKERS_CACHE))
+            return _KNOWN_TICKERS_CACHE
+        except Exception as e:
+            logger.warning("Ticker-Universum konnte nicht geladen werden, nutze Fallback: %s", e)
+
+    _KNOWN_TICKERS_CACHE = set(STATIC_ETFS)
+    return _KNOWN_TICKERS_CACHE
+
+
 def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
-    """Gruppiert News und erkennt Ticker sowie Earnings-Events."""
+    """Gruppiert News und erkennt Ticker sowie Earnings-Events.
+
+    Ein Wort gilt nur dann als Ticker, wenn es:
+      1. im Originaltext bereits komplett groß geschrieben war (kein .upper()-Trick),
+      2. 2-5 Buchstaben lang ist (rein alphabetisch),
+      3. im handelbaren Ticker-Universum (Nasdaq + ETFs) vorkommt.
+    Cluster ohne erkannten Ticker werden verworfen.
+    """
+    known_tickers = _load_known_tickers()
     clusters = []
     seen = set()
 
     for art in articles:
-        title_upper = art["title"].upper()
-        ticker = "UNKNOWN"
-        
-        # Verbesserte Ticker-Erkennung mit Zeichenreinigung
-        for word in title_upper.split():
+        original_title = art["title"]
+        title_upper = original_title.upper()  # nur für Earnings-Keyword-Suche
+        ticker = None
+
+        # Ticker NUR im Originaltext suchen — title.upper() würde alles matchen
+        for word in original_title.split():
             clean = word.strip(".,:;()[]{}'\"")
-            if clean.isupper() and 2 <= len(clean) <= 5 and clean not in seen:
+            if (clean.isupper()
+                    and 2 <= len(clean) <= 5
+                    and clean.isalpha()
+                    and clean in known_tickers
+                    and clean not in seen):
                 ticker = clean
                 break
 
+        # Cluster ohne erkennbaren Ticker nicht in den Report aufnehmen
+        if ticker is None:
+            continue
+
         # Keyword-basierte Earnings-Erkennung
-        is_earnings = any(kw in title_upper for kw in ["EARNINGS", "BEAT", "MISS", "REPORT", "RESULTS", "Q1", "Q2", "Q3", "Q4"])
+        is_earnings = any(kw in title_upper for kw in
+                          ["EARNINGS", "BEAT", "MISS", "REPORT", "RESULTS",
+                           "Q1", "Q2", "Q3", "Q4"])
 
         clusters.append({
             "ticker": ticker,
-            "headline_repr": art["title"][:100],
-            "confidence_score": 8.0 if is_earnings else 5.0, # Earnings-Gewichtung[cite: 1]
+            "headline_repr": original_title[:100],
+            "confidence_score": 8.0 if is_earnings else 5.0,
             "sentiment_score": 0.65 if is_earnings else 0.2,
             "sentiment_source": "keyword",
-            "event_type": "earnings" if is_earnings else "news"
+            "event_type": "earnings" if is_earnings else "news",
         })
         seen.add(ticker)
 
     return clusters
 
+
 def run_claude(cluster_text: str, market_time: str, market_status: str, api_key: str) -> str:
     """Ruft Claude auf und extrahiert das Signal mittels Regex."""
     if not api_key:
-        logger.error("ANTHROPIC_API_KEY fehlt[cite: 1]")
+        logger.error("ANTHROPIC_API_KEY fehlt")
         return "TICKER_SIGNALS:NONE"
 
     user_message = f"Marktzeit: {market_time}\nMarktstatus: {market_status}\n\n{cluster_text}"
@@ -155,7 +206,7 @@ def run_claude(cluster_text: str, market_time: str, market_status: str, api_key:
             json={
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 800,
-                "temperature": 0.0, # Maximale Deterministik[cite: 1]
+                "temperature": 0.0,  # Maximale Deterministik
                 "system": SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": user_message}]
             },
@@ -167,19 +218,20 @@ def run_claude(cluster_text: str, market_time: str, market_status: str, api_key:
         raw_text = data["content"][0]["text"].strip()
         logger.debug("Claude Rohantwort:\n%s", raw_text[:400])
 
-        # ROBUSTE EXTRAKTION: Sucht nach TICKER_SIGNALS überall im Text[cite: 1]
+        # ROBUSTE EXTRAKTION: Sucht nach TICKER_SIGNALS überall im Text
         match = re.search(r'(TICKER_SIGNALS:[^\n\r]+)', raw_text, re.IGNORECASE)
         if match:
             signal_line = match.group(1).strip().upper()
-            logger.info("✅ Claude Signal extrahiert: %s[cite: 1]", signal_line)
+            logger.info("✅ Claude Signal extrahiert: %s", signal_line)
             return signal_line
 
-        logger.warning("Kein gültiges TICKER_SIGNALS-Format gefunden[cite: 1]")
+        logger.warning("Kein gültiges TICKER_SIGNALS-Format gefunden")
         return "TICKER_SIGNALS:NONE"
 
     except Exception as e:
-        logger.error("Claude API Fehler: %s[cite: 1]", e)
+        logger.error("Claude API Fehler: %s", e)
         return "TICKER_SIGNALS:NONE"
+
 
 def get_market_context() -> tuple:
     """Schnittstelle zum Markt-Kalender."""
@@ -188,6 +240,7 @@ def get_market_context() -> tuple:
         return market_context()
     except ImportError:
         return datetime.now().strftime("%H:%M"), "OPEN"
+
 
 # ==================== TEST MODUS ====================
 if __name__ == "__main__":

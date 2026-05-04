@@ -146,6 +146,7 @@ COMPANY_NAME_OVERRIDES = {
     "johnson and johnson": "JNJ",   # nach &-Normalisierung
     "merck": "MRK",
     "unitedhealth": "UNH",
+    "cigna": "CI",
     "disney": "DIS",
     "walt disney": "DIS",
     "starbucks": "SBUX",
@@ -163,12 +164,25 @@ COMPANY_NAME_OVERRIDES = {
     "nike": "NKE",
 }
 
-# Generische Wörter, die als Firmenname zu False-Positives führen
+# Generische Wörter, die als Firmenname zu False-Positives führen.
+# Liste wird laufend erweitert basierend auf beobachteten Match-Fehlern.
 _NAME_BLOCKLIST = {
+    # Generische Geo/Größe-Adjektive
     "global", "international", "american", "national", "general",
-    "first", "new", "us", "usa", "the", "and", "of",
-    "block", "match", "snap", "square",  # zu generisch trotz echter Ticker
-    "trade", "world", "city", "state", "united",
+    "first", "new", "us", "usa", "united", "world",
+    "the", "and", "of", "for",
+    # Penny-Stock-Falle: Ticker existiert, Wort ist aber zu häufig
+    "block", "match", "snap", "square", "trade", "city", "state",
+    "here", "there", "this", "that", "them",
+    "viking", "emerging",
+    # Sektor-/Branchenwörter, die News oft enthalten
+    "strategy",  # MSTR seit Umbenennung von MicroStrategy
+    "energy", "tech", "financial", "industrial", "consumer",
+    "media", "data", "research", "services", "solutions",
+    "systems", "products", "technologies", "innovations",
+    # Investment-Vokabular
+    "capital", "equity", "fund", "income", "growth", "value",
+    "dividend", "premium", "core", "alpha", "beta",
 }
 
 # Modul-weiter Cache, vermeidet wiederholtes Parsen der SEC-Datei

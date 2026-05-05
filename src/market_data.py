@@ -400,13 +400,16 @@ def _safe_float(value, default=0.0) -> float:
 
 
 def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
-                       expected_move_pct: float, realized_vol_20d: float | None = None) -> dict | None:
+                       expected_move_pct: float, realized_vol_20d: float | None = None,
+                       earnings_soon: bool = False, news_driven: bool = False,
+                       iv_percentile: float | None = None) -> dict | None:
     """
     Bewertet eine einzelne Long-Option auf erwarteten Vorteil nach Kosten.
     Kein vollwertiges Black-Scholes-Modell, aber konservativer als Delta-only:
     - Entry zwischen Mid und Ask
     - Exit-Slippage härter als Entry
     - IV/RV-Penalty bei sehr teurer IV
+    - Vega-Cost / IV-Crush nach Event (Schritt-1-Patch)
     - keine Sentiment-Komponente im EV
     """
     g = option.get("greeks") or {}
@@ -421,6 +424,7 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
     delta = _safe_float(g.get("delta"))
     gamma = _safe_float(g.get("gamma"))
     theta = _safe_float(g.get("theta"))
+    vega = _safe_float(g.get("vega"))
     iv_raw = g.get("mid_iv") or g.get("ask_iv") or g.get("bid_iv")
     iv = _safe_float(iv_raw, None)
     oi = int(_safe_float(option.get("open_interest"), 0))
@@ -439,6 +443,38 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
     gamma_gain = 0.5 * abs(gamma) * (move_abs ** 2)
     theta_cost = abs(theta) * RULES.ev_hold_days if theta else 0.0
 
+    # ── Vega-Cost / IV-Crush (Schritt-1-Patch) ─────────────────────────
+    # Long-Optionen verlieren systematisch durch Vega, wenn die IV nach
+    # einem Event zurueckkommt. Tradier liefert Vega "pro 1.0 IV-Punkt"
+    # (also: bei IV-Drop von 1.0 auf 0.0 waere Vega-P&L = -|vega|).
+    # iv_drop_decimal hat dieselbe Einheit wie iv (Dezimal, z.B. 0.40 = 40%).
+    iv_drop_decimal = 0.0
+    iv_crush_factor_used = 0.0
+    if iv and iv > 0:
+        if earnings_soon:
+            crush_pct = RULES.iv_crush_after_earnings_pct
+        elif news_driven:
+            crush_pct = RULES.iv_crush_after_news_pct
+        else:
+            crush_pct = RULES.iv_crush_baseline_pct
+
+        # Aufschlag bei sehr teurer IV: wenn die IV ohnehin hoch steht,
+        # ist der erwartete Crush ueberdurchschnittlich.
+        high_iv_flag = False
+        if realized_vol_20d and realized_vol_20d > 0 and iv / realized_vol_20d >= RULES.mature_iv_to_rv_hard_block:
+            high_iv_flag = True
+        if iv_percentile is not None and iv_percentile >= 90.0:
+            high_iv_flag = True
+        if high_iv_flag:
+            crush_pct += RULES.iv_crush_high_iv_bonus_pct
+
+        # Begrenzen, falls Faktor durch Bonus exotisch wird.
+        crush_pct = max(0.0, min(0.60, crush_pct))
+        iv_drop_decimal = iv * crush_pct
+        iv_crush_factor_used = crush_pct
+
+    vega_cost = abs(vega) * iv_drop_decimal
+
     entry_slippage = max(0.0, entry - mid)
     exit_slip = exit_slippage_points(opt_data)
 
@@ -450,7 +486,7 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
             # Keine harte Sperre außerhalb Earnings, aber EV wird konservativ reduziert.
             iv_rv_penalty = entry * min(0.35, (iv_to_rv - RULES.max_iv_to_rv_general) * RULES.iv_rv_penalty_factor)
 
-    expected_option_gain = max(0.0, delta_gain + gamma_gain - theta_cost)
+    expected_option_gain = max(0.0, delta_gain + gamma_gain - theta_cost - vega_cost)
     ev_points = expected_option_gain - entry_slippage - exit_slip - iv_rv_penalty
     ev_dollars = round(ev_points * 100.0, 2)
     ev_pct = round(ev_points / entry * 100.0, 2) if entry > 0 else -999.0
@@ -497,6 +533,14 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
         "realized_vol_20d": round(realized_vol_20d, 5) if realized_vol_20d else None,
         "iv_to_rv": iv_to_rv,
         "iv_rv_penalty": round(iv_rv_penalty, 4),
+        # Vega-Cost-Diagnose (Schritt-1-Patch)
+        "vega_cost_points": round(vega_cost, 4),
+        "vega_cost_dollars": round(vega_cost * 100.0, 2),
+        "iv_drop_assumed_decimal": round(iv_drop_decimal, 5),
+        "iv_crush_factor_used": round(iv_crush_factor_used, 3),
+        "iv_crush_mode": ("earnings" if earnings_soon
+                          else "news" if news_driven
+                          else "baseline"),
         "open_interest": oi,
         "volume": volume,
         "fill_probability": fill_p,
@@ -636,7 +680,9 @@ def get_tradier_options(symbol, direction, tradier_token,
             if opt.get("option_type") != opt_type:
                 continue
             ev = evaluate_option_ev(opt, direction, underlying_price, expected_move_pct,
-                                    realized_vol_20d=rv20)
+                                    realized_vol_20d=rv20,
+                                    earnings_soon=earnings_soon,
+                                    news_driven=True)
             if ev is None:
                 continue
             ev["expiration"] = target_exp

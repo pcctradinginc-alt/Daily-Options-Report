@@ -40,7 +40,7 @@ _NAME_TO_TICKER_CACHE: dict[str, str] | None = None
 _GENERIC_ACRONYMS = {
     "AI", "IT", "IP", "EV", "CEO", "CFO", "CTO", "IPO",
     "API", "SAAS", "ESG", "AR", "VR", "ML",
-    "USA", "GDP", "FED", "ETF", "REIT", "SPAC",
+    "USA", "UK", "GDP", "FED", "ETF", "REIT", "SPAC",
 }
 
 logger = logging.getLogger(__name__)

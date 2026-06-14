@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,16 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DB_PATH = DATA_DIR / "trading_journal.sqlite"
+
+
+def resolve_db_path() -> Path:
+    """DB-Pfad zur AUFRUFZEIT bestimmen (nicht beim Import gebunden).
+
+    Erlaubt Test-Isolation/Override via Umgebungsvariable JOURNAL_DB_PATH, ohne dass
+    ein Import oder Aufruf je die echte Produktiv-DB anfasst. Ohne Override: Standardpfad.
+    """
+    override = os.environ.get("JOURNAL_DB_PATH")
+    return Path(override) if override else DB_PATH
 
 OUTCOME_HORIZONS = {
     "1H": timedelta(hours=1),
@@ -48,9 +59,10 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
 
 
-def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(db_path, timeout=10)
+def connect(db_path: Path | None = None) -> sqlite3.Connection:
+    path = Path(db_path) if db_path is not None else resolve_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path, timeout=10)
     con.row_factory = sqlite3.Row
     # DELETE statt WAL: Single-Writer-Batch-Prozess. Vermeidet, dass ungecheckpointete
     # -wal-Daten beim GitHub-Actions-Cache-Save verloren gehen (jede Transaktion landet

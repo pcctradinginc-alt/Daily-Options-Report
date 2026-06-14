@@ -8,3 +8,6 @@ feedparser>=6.0.10
 scikit-learn>=1.5
 pandas>=2.2
 joblib>=1.4
+# Optional: bevorzugter Gradient-Boosting-Estimator des ML-Predictors. Fehlt das Paket,
+# fällt ml_predictor automatisch auf sklearn HistGradientBoosting zurück (kein harter Bruch).
+xgboost>=2.0

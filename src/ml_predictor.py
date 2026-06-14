@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,24 @@ except Exception as exc:  # pragma: no cover
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MODEL_PATH = DATA_DIR / "ml_outcome_model.joblib"
 FEATURES_PATH = DATA_DIR / "ml_feature_names.json"
+
+
+def _artifact_dir() -> Path:
+    """Artefakt-Verzeichnis zur AUFRUFZEIT (Test-Isolation via ML_DATA_DIR).
+
+    Ohne Override: data/. Verhindert, dass ein Trainingslauf im Test je das echte
+    Produktiv-Modell überschreibt."""
+    override = os.environ.get("ML_DATA_DIR")
+    return Path(override) if override else DATA_DIR
+
+
+def _model_path() -> Path:
+    return _artifact_dir() / "ml_outcome_model.joblib"
+
+
+def _features_path() -> Path:
+    return _artifact_dir() / "ml_feature_names.json"
+
 
 NAN = float("nan")
 
@@ -246,9 +265,10 @@ class OutcomePredictor:
             return False
         if self._bundle is not None:
             return True
-        if MODEL_PATH.exists():
+        model_path = _model_path()
+        if model_path.exists():
             try:
-                self._bundle = joblib.load(MODEL_PATH)
+                self._bundle = joblib.load(model_path)
                 return True
             except Exception as exc:
                 logger.warning("ML-Modell konnte nicht geladen werden: %s", exc)
@@ -478,9 +498,10 @@ class OutcomePredictor:
         bundle = {"model": model, "regressor": regressor, "features": selected,
                   "medians": medians, "importances": importances, "meta": meta}
 
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        joblib.dump(bundle, MODEL_PATH)
-        FEATURES_PATH.write_text(json.dumps(selected, indent=2), encoding="utf-8")
+        artifact_dir = _artifact_dir()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump(bundle, _model_path())
+        _features_path().write_text(json.dumps(selected, indent=2), encoding="utf-8")
         self._bundle = bundle
         logger.info("ML-Modell trainiert: algo=%s n=%d win_rate=%.2f feats=%d oos=%s",
                     algo, n, meta["win_rate"], len(selected), oos)

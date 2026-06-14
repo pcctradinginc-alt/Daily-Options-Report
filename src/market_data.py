@@ -489,6 +489,12 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
     # C3: Tradier/ORATS-Vega ist pro 1 Vol-Punkt (1%). iv_drop_decimal ist in Dezimal-IV,
     # daher * vega_iv_points_per_unit (=100) auf Vol-Punkte. Ohne diese Korrektur wäre der
     # IV-Crush-Kostenblock ~100x zu klein.
+    #
+    # OFFENER VERIFIKATIONSPUNKT (vor Produktiv-Einsatz prüfen): Die Annahme "Vega pro 1
+    # Vol-Punkt" ist die marktübliche Greeks-Konvention, aber gegen ein ECHTES Tradier-
+    # Optionsbeispiel gegenzurechnen — d.h. erwartete Preisänderung bei +1 Vol-Punkt IV
+    # gegen vega vergleichen. test_vega_cost_units_fixed prüft nur, DASS der Faktor 100
+    # angewandt wird, nicht die Konvention selbst.
     vega_cost = abs(vega) * iv_drop_decimal * RULES.vega_iv_points_per_unit
 
     entry_slippage = max(0.0, entry - mid)

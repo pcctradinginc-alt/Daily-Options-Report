@@ -23,6 +23,7 @@ from rules import parse_ticker_signals, RULES, merge_reasons
 from simple_journal import journal
 from ml_predictor import OutcomePredictor, extract_features
 from llm_schema import validate_ticker_signal_line
+from gates import _hard_gates_ok, _enforce_gates_on_decision
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -90,41 +91,8 @@ def _enrich_market_data_with_cluster_context(market_data: list, clusters: list) 
             d["news_sentiment_source"] = best.get("sentiment_source", "keyword")
 
 
-def _hard_gates_ok(d: dict) -> tuple[bool, str]:
-    """Harte per-Ticker-Gates aus process_ticker — deterministisch, NICHT LLM-abhängig.
-
-    Wird nach dem Claude-Call auf den gewählten Ticker angewendet, damit Liquidity/EV/
-    DataQuality/Sector/Earnings-IV wirklich erzwungen werden (C2), nicht nur per Prompt.
-    """
-    opt = d.get("options") or {}
-    if not d.get("_data_quality_ok"):
-        return False, d.get("_data_quality_reason") or "Data-Quality fail"
-    if d.get("_liquidity_fail"):
-        return False, d.get("_liquidity_reason") or "Liquidity fail"
-    if not opt.get("ev_ok"):
-        return False, opt.get("ev_fail_reason") or "EV fail"
-    if not d.get("sector_filter_ok", True):
-        return False, d.get("sector_filter_reason") or "Sector fail"
-    if not opt.get("earnings_iv_ok", True):
-        return False, opt.get("earnings_iv_reason") or "Earnings/IV fail"
-    return True, "ok"
-
-
-def _enforce_gates_on_decision(data: dict, gate_status: dict) -> dict:
-    """C2: erzwingt, dass der von Claude gewählte Ticker alle Gates bestanden hat.
-
-    Greift NUR, wenn Claude einen Trade vorschlägt. Andernfalls fail-closed No-Trade.
-    Reine Funktion (testbar); mutiert und liefert data zurück.
-    """
-    if data.get("no_trade"):
-        return data
-    sel = str(data.get("ticker", "")).upper()
-    st = gate_status.get(sel)
-    if st is None or not st.get("cleared"):
-        why = st["reason"] if st else "Ticker nicht in geprüften Marktdaten"
-        data["no_trade"] = True
-        data["no_trade_grund"] = merge_reasons(data.get("no_trade_grund"), f"Hard-Gate {sel}: {why}")
-    return data
+# Hard-Gate-Funktionen leben jetzt in gates.py (leichtgewichtig, ohne ML-/News-Importe)
+# und werden oben re-importiert — _hard_gates_ok / _enforce_gates_on_decision.
 
 
 # ====================== MAIN ======================

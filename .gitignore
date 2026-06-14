@@ -17,6 +17,11 @@ data/*.sqlite-wal
 data/*.sqlite-shm
 data/ml_outcome_model.joblib
 data/ml_feature_names.json
+# Test-/Coverage-Artefakte
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
 .DS_Store
 .idea/
 .vscode/

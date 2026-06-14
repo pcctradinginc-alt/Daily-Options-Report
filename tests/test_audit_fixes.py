@@ -75,8 +75,10 @@ def test_directional_capture_active():
 
 
 # ── C2: harte Gate-Durchsetzung (post-Claude) ─────────────────────────────
+# Import aus gates statt main: testet dieselbe Logik ohne den schweren App-Graph
+# (torch/transformers/sklearn) zu laden -> schneller, weniger Test-Kopplung.
 def test_hard_gates_ok():
-    from main import _hard_gates_ok
+    from gates import _hard_gates_ok
     good = {"_data_quality_ok": True, "_liquidity_fail": False, "sector_filter_ok": True,
             "options": {"ev_ok": True, "earnings_iv_ok": True}}
     assert _hard_gates_ok(good)[0] is True
@@ -97,7 +99,7 @@ def test_hard_gates_ok():
 
 
 def test_enforce_gates_on_decision():
-    from main import _enforce_gates_on_decision
+    from gates import _enforce_gates_on_decision
     gate = {
         "NVDA": {"cleared": True, "reason": "ok"},
         "TSLA": {"cleared": False, "reason": "EV fail"},

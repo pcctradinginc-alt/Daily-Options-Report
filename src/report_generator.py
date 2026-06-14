@@ -724,6 +724,34 @@ def build_monthly_winrate_html(stats: dict) -> str:
                      table("Pro VIX-Regime", stats.get("by_regime", [])) +
                      table("Exit-Gründe (Anteil aufgelöster Trades)", stats.get("exit_reasons", [])))
 
+    # Paper-Trading (simuliert, ehrlich): Fill-Rate, PnL, Profit-Factor, Max-DD.
+    paper = stats.get("paper", {})
+
+    def _money(v):
+        if v is None:
+            return "n/v"
+        return f'{"+" if v >= 0 else "−"}${abs(v):,.0f}'
+
+    fr = paper.get("fill_rate")
+    pf = paper.get("profit_factor")
+    pnl = paper.get("paper_pnl")
+    wrf = paper.get("win_rate_filled")
+    mdd = paper.get("max_drawdown") or 0
+    pf_col = DK if pf is None else (G if pf >= 1.2 else (R if pf < 1.0 else O))
+    paper_inner = (
+        row("Orders gesamt", str(paper.get("n_orders", 0))) +
+        row("Fill-Rate",
+            "n/v" if fr is None else f'{fr*100:.0f}% ({paper.get("n_filled",0)}/{paper.get("n_orders",0)})',
+            G if (fr or 0) >= 0.8 else O) +
+        row("No-Fill (kein Label)", str(paper.get("n_no_fill", 0)), GR) +
+        row("Paper-PnL (1 Kontrakt/Trade)", _money(pnl), G if (pnl or 0) >= 0 else R) +
+        row("Profit-Factor", "n/v" if pf is None else f'{pf:.2f}', pf_col) +
+        row("Max-Drawdown", f'−${mdd:,.0f}' if mdd else "$0", R if mdd else GR) +
+        row("Win-Rate (nur gefüllte)",
+            "n/v" if wrf is None else f'{wrf*100:.0f}% (n={paper.get("n_resolved",0)})',
+            G if (wrf or 0) >= 0.5 else R, last=True))
+    paper_card = card("📝", "#fff3e0", "Paper-Trading (simuliert, Entry≈Limit · Exit am Bid)", paper_inner)
+
     # Feature-Importances.
     fi = stats.get("feature_importance", [])
     if fi:
@@ -749,7 +777,7 @@ def build_monthly_winrate_html(stats: dict) -> str:
             f'<h1 style="margin:0 0 4px 0;font-size:28px;font-weight:700;color:{DK};">'
             f'Monthly Win-Rate Report</h1>'
             f'<p style="margin:0;font-size:15px;color:{GR};">{month}</p></div>'
-            f'{notice}{overall_card}{ml_card}{breakdown}{fi_card}'
+            f'{notice}{overall_card}{paper_card}{ml_card}{breakdown}{fi_card}'
             f'<div style="text-align:center;padding:18px 0;border-top:1px solid {BD};margin-top:8px;">'
             f'<p style="margin:0;font-size:11px;color:{GR};">Label: echte Exit-Regeln (TP/SL/Time-Stop) '
             f'auf Optionsebene · forward-only</p></div></div></body></html>')

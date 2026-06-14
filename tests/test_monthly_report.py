@@ -50,11 +50,26 @@ def _seed(n: int, *, with_ml_prob: bool = True) -> None:
         )
         signal_id = int(sig.lastrowid)
         con.execute(
-            "INSERT INTO trade_resolutions(signal_id, run_id, ticker, entry_price, opened_at, "
-            "status, exit_reason, exit_return_pct, is_win, resolved_at) "
-            "VALUES (?, ?, ?, 1.0, ?, 'resolved', ?, ?, ?, ?)",
+            "INSERT INTO trade_resolutions(signal_id, run_id, ticker, entry_price, quantity, "
+            "opened_at, status, exit_reason, exit_return_pct, is_win, resolved_at) "
+            "VALUES (?, ?, ?, 1.0, 1, ?, 'resolved', ?, ?, ?, ?)",
             (signal_id, run_id, "SYN", resolved_at, exit_reasons[i % 4],
              50.0 if is_win else -30.0, is_win, resolved_at),
+        )
+        # Gefüllte Paper-Order zu jedem aufgelösten Trade.
+        con.execute(
+            "INSERT INTO paper_orders(signal_id, run_id, ticker, option_symbol, filled, "
+            "fill_reason, simulated_fill_price, created_at) "
+            "VALUES (?, ?, ?, ?, 1, 'filled_conservative', 1.0, ?)",
+            (signal_id, run_id, "SYN", "SYN99C", resolved_at),
+        )
+    # Zusätzlich ein paar No-Fill-Orders (ohne Label) für die Fill-Rate.
+    for j in range(n // 5):
+        con.execute(
+            "INSERT INTO paper_orders(signal_id, run_id, ticker, option_symbol, filled, "
+            "fill_reason, simulated_fill_price, created_at) "
+            "VALUES (?, ?, ?, ?, 0, 'no_quote', NULL, ?)",
+            (10_000 + j, 1, "NOQ", "NOQ99C", "2026-06-01T00:00:00+00:00"),
         )
     con.commit()
     con.close()
@@ -127,6 +142,43 @@ def test_insufficient_flag_small_sample():
     stats = mr.compute_stats({})
     assert stats["overall"]["n"] == 8
     assert stats["insufficient"] is True   # < MIN_SAMPLE (30)
+
+
+# ── Paper-Trading-Metriken ────────────────────────────────────────────────
+def test_paper_metrics():
+    _seed(45, with_ml_prob=True)   # 45 gefüllt + 9 No-Fill, ~2/3 Win, Entry 1.0
+    import monthly_winrate_report as mr
+    p = mr.compute_stats({})["paper"]
+
+    assert p["n_orders"] == 54          # 45 filled + 9 no-fill
+    assert p["n_filled"] == 45 and p["n_no_fill"] == 9
+    assert abs(p["fill_rate"] - 45 / 54) < 0.01
+    assert abs(p["no_fill_rate"] - 9 / 54) < 0.01
+    assert p["n_resolved"] == 45
+    # 30 Wins × +$50, 15 Losses × −$30 -> PnL +$1050, PF = 1500/450 ≈ 3.33
+    assert abs(p["paper_pnl"] - 1050.0) < 1.0
+    assert 3.0 < p["profit_factor"] < 3.7
+    assert p["max_drawdown"] >= 0.0
+    assert abs(p["win_rate_filled"] - 30 / 45) < 0.02
+
+
+def test_paper_metrics_empty_db():
+    import monthly_winrate_report as mr
+    p = mr.compute_stats({})["paper"]
+    assert p["n_orders"] == 0
+    assert p["fill_rate"] is None and p["no_fill_rate"] is None
+    assert p["profit_factor"] is None          # ohne Verluste/Daten undefiniert
+    assert p["paper_pnl"] == 0 and p["max_drawdown"] == 0
+
+
+def test_paper_card_renders_in_html():
+    _seed(40, with_ml_prob=True)
+    import monthly_winrate_report as mr
+    import report_generator as rg
+    html = rg.build_monthly_winrate_html(mr.compute_stats({}))
+    assert "Paper-Trading" in html
+    assert "Fill-Rate" in html
+    assert "Profit-Factor" in html
 
 
 if __name__ == "__main__":

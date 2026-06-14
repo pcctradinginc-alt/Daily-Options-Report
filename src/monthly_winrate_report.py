@@ -78,6 +78,60 @@ def _forward_calibration(rows: list[dict], n_bins: int = 10) -> list[dict]:
     return out
 
 
+def _paper_stats(con) -> dict:
+    """Paper-Trading-Kennzahlen: Fill-/No-Fill-Rate, Paper-PnL, Profit-Factor, Max-Drawdown,
+    Win-Rate (nur gefüllte = aufgelöste Trades).
+
+    PnL je Trade = exit_return_pct% · entry_price · 100 · quantity (1 Kontrakt = 100 Stück).
+    Entry ist der echte simulierte Fill-Preis, Exit am Bid (siehe trading_journal). Damit ist
+    die Performance konservativ; No-Fills sind absichtlich NICHT gelabelt und zählen nicht zur PnL.
+    """
+    orders = con.execute("SELECT filled FROM paper_orders").fetchall()
+    n_orders = len(orders)
+    n_filled = sum(1 for o in orders if o["filled"])
+    n_no_fill = n_orders - n_filled
+
+    res = con.execute(
+        "SELECT exit_return_pct, entry_price, quantity, is_win, resolved_at "
+        "FROM trade_resolutions WHERE status='resolved' AND is_win IS NOT NULL "
+        "AND exit_return_pct IS NOT NULL ORDER BY resolved_at ASC"
+    ).fetchall()
+
+    pnls: list[float] = []
+    wins = 0
+    for r in res:
+        entry = r["entry_price"] or 0.0
+        qty = r["quantity"] or 1
+        pnls.append((r["exit_return_pct"] / 100.0) * entry * 100.0 * qty)
+        wins += int(bool(r["is_win"]))
+
+    gains = sum(p for p in pnls if p > 0)
+    losses = -sum(p for p in pnls if p < 0)
+    # Max-Drawdown auf der kumulativen Equity-Kurve (chronologisch).
+    equity = peak = max_dd = 0.0
+    for p in pnls:
+        equity += p
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+
+    n_res = len(pnls)
+    return {
+        "n_orders": n_orders,
+        "n_filled": n_filled,
+        "n_no_fill": n_no_fill,
+        "fill_rate": round(n_filled / n_orders, 3) if n_orders else None,
+        "no_fill_rate": round(n_no_fill / n_orders, 3) if n_orders else None,
+        "n_resolved": n_res,
+        "paper_pnl": round(sum(pnls), 2),
+        "gains": round(gains, 2),
+        "losses": round(losses, 2),
+        # Profit-Factor undefiniert ohne Verluste (kleine Stichprobe) -> None, ehrlich ausweisen.
+        "profit_factor": round(gains / losses, 2) if losses > 0 else None,
+        "max_drawdown": round(max_dd, 2),
+        "win_rate_filled": round(wins / n_res, 3) if n_res else None,
+    }
+
+
 def wilson_ci(wins: int, n: int, z: float = 1.96) -> tuple[float | None, float | None]:
     """Wilson-Score-Konfidenzintervall für eine Erfolgsquote."""
     if n <= 0:
@@ -154,6 +208,7 @@ def compute_stats(cfg: dict) -> dict:
         WHERE tr.status = 'resolved' AND tr.is_win IS NOT NULL
         """
     ).fetchall()
+    paper = _paper_stats(con)
     con.close()
 
     rows = [dict(r) for r in raw]
@@ -271,6 +326,7 @@ def compute_stats(cfg: dict) -> dict:
         "by_strength": by_strength,
         "by_sector": by_sector,
         "by_regime": by_regime,
+        "paper": paper,
         "exit_reasons": exit_reasons,
         "selection_bias_note": SELECTION_BIAS_NOTE,
         "feature_importance": feature_importance,

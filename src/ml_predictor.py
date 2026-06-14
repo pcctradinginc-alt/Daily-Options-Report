@@ -36,7 +36,12 @@ Felder (direction/horizon/dte). KEIN Feld nutzt Daten aus der Zukunft:
   - vix/vix_regime                              : VIX bei Run-Start
   - dir_call/horizon_num/dte_days/is_etf        : Signal-Parameter
   - data_quality_score                          : Datenqualität des Snapshots
-Bewusst NICHT als Feature: alles aus `trade_resolutions`/`outcomes` (= Label/Zukunft).
+  - entry_spread_pct/entry_price_vs_mid_pct     : Options-Mikrostruktur zum Entscheid;
+        der konservative Fill ist deterministisch aus bid/ask/mid (paper_broker Modell a)
+        und damit VOR dem Fill bekannt — kein Realized-/Slippage-Wert.
+Bewusst NICHT als Feature (Leak/Zukunft): alles aus `trade_resolutions`/`outcomes`/`paper_orders`
+nach dem Entscheid — insbesondere realized_slippage, Exit-Preise, fill_delay (im Tagestakt
+ohnehin bedeutungslos) und aggregierte no_fill_rate_by_setup (nur as-of-decision zulässig).
 
 CLI:
     python src/ml_predictor.py --train        # trainieren (falls genug Daten)
@@ -112,16 +117,19 @@ ALL_FEATURES = [
     "news_alpha", "news_sentiment_score", "sentiment_price_score_adjustment",
     "vix", "vix_regime", "dir_call", "horizon_num", "dte_days", "is_etf",
     "data_quality_score",
+    # Entry-Mikrostruktur (Decision-Zeit, aus dem Options-Snapshot; siehe Audit unten).
+    "entry_spread_pct", "entry_price_vs_mid_pct",
 ]
 # Rückwärtskompatibler Alias.
 FEATURE_COLUMNS = ALL_FEATURES
 
 # Reduziertes, robustes Start-Set (Risiko: Overfitting bei vielen Features + wenig Daten).
 # Bewusst klein gehalten und auf die ökonomisch tragfähigsten Treiber beschränkt.
+# entry_spread_pct ist ein echter Kostentreiber (weiter Spread -> schlechtere Fills/Exits).
 CORE_FEATURES = [
     "score", "ev_pct", "breakeven_move_pct", "iv_to_rv", "iv_rank",
     "gap_pct", "rvol", "news_alpha", "sentiment_price_score_adjustment",
-    "vix", "vix_regime", "dir_call", "dte_days",
+    "vix", "vix_regime", "dir_call", "dte_days", "entry_spread_pct",
 ]
 
 
@@ -164,6 +172,13 @@ def extract_features(d: dict, vix: Any, direction: Any, horizon: Any, dte_days: 
     opt = d.get("options") or {}
     above = d.get("above_ma50")
     vix_num = _num(vix)
+    # Entry-Mikrostruktur: beide aus dem Options-Snapshot ZUM ENTSCHEIDUNGSZEITPUNKT.
+    # Kein Leak: der konservative Fill ist deterministisch aus bid/ask/mid (paper_broker
+    # Modell a) und damit schon vor jedem Fill bekannt — es sind KEINE Realized-/Exit-Werte.
+    ce = _num(opt.get("conservative_entry"))
+    mid_px = _num(opt.get("midpoint"))
+    entry_vs_mid = (((ce - mid_px) / mid_px * 100.0)
+                    if (mid_px == mid_px and mid_px != 0 and ce == ce) else NAN)
     return {
         "score": _num(d.get("score")),
         "raw_signal_score": _num(d.get("raw_signal_score")),
@@ -193,6 +208,8 @@ def extract_features(d: dict, vix: Any, direction: Any, horizon: Any, dte_days: 
         "dte_days": _num(dte_days),
         "is_etf": 1.0 if d.get("is_etf") else 0.0,
         "data_quality_score": _num(d.get("data_quality_score")),
+        "entry_spread_pct": _num(opt.get("spread_pct")),
+        "entry_price_vs_mid_pct": entry_vs_mid,
     }
 
 

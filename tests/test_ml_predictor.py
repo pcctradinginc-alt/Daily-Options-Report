@@ -59,6 +59,8 @@ def _seed_dataset(n: int, *, learnable: bool = True, single_class: bool = False)
                 "breakeven_move_pct": rnd.uniform(1.0, 6.0),
                 "iv_to_rv": rnd.uniform(0.8, 1.6),
                 "iv_rank": rnd.uniform(0.0, 100.0), "iv_percentile": rnd.uniform(0.0, 100.0),
+                "spread_pct": rnd.uniform(2.0, 15.0),
+                "midpoint": 1.10, "conservative_entry": rnd.uniform(1.00, 1.12),
             },
         }
         direction = rnd.choice(["CALL", "PUT"])
@@ -103,6 +105,14 @@ def test_extract_features_matches_all_features():
     assert set(feats.keys()) == set(ALL_FEATURES)
     assert feats["dir_call"] == 1.0
     assert feats["vix_regime"] == 1.0  # 20 -> Mid
+
+
+def test_entry_microstructure_features():
+    from ml_predictor import extract_features
+    d = {"options": {"spread_pct": 12.0, "midpoint": 1.00, "conservative_entry": 0.95}}
+    f = extract_features(d, vix=20, direction="CALL", horizon="T1", dte_days=7)
+    assert f["entry_spread_pct"] == 12.0
+    assert abs(f["entry_price_vs_mid_pct"] - (-5.0)) < 1e-6   # (0.95-1.00)/1.00*100
 
 
 # ── Cold-Start (kein Modell, keine Daten) ─────────────────────────────────

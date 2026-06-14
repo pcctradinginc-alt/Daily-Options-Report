@@ -201,6 +201,37 @@ def init_db(con: sqlite3.Connection) -> None:
             is_win INTEGER,                      -- 1 | 0 | NULL
             win_threshold_used TEXT,
             resolved_at TEXT,
+            paper_order_id INTEGER,              -- Quelle: simulierter Paper-Fill
+            quantity INTEGER DEFAULT 1,
+            fill_price REAL,                     -- realer simulierter Entry-Fill (= entry_price)
+            FOREIGN KEY(signal_id) REFERENCES signals(signal_id),
+            UNIQUE(signal_id)
+        );
+
+        -- Paper-Trading-Audit: JEDE simulierte Entry-Order (gefüllt ODER nicht). No-Fill
+        -- wird hier festgehalten, erzeugt aber KEIN trade_resolutions-Label ("No Fill = kein Label").
+        CREATE TABLE IF NOT EXISTS paper_orders (
+            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER NOT NULL,
+            run_id INTEGER,
+            ticker TEXT NOT NULL,
+            option_symbol TEXT,
+            direction TEXT,
+            side TEXT,
+            quantity INTEGER,
+            expiration TEXT,
+            strike REAL,
+            bid_at_signal REAL,
+            ask_at_signal REAL,
+            mid_at_signal REAL,
+            limit_price REAL,
+            simulated_fill_price REAL,
+            filled INTEGER,                      -- 1 | 0
+            fill_reason TEXT,                    -- filled_conservative | no_quote
+            entry_spread_pct REAL,
+            entry_price_vs_mid_pct REAL,
+            created_at TEXT NOT NULL,
+            filled_at TEXT,
             FOREIGN KEY(signal_id) REFERENCES signals(signal_id),
             UNIQUE(signal_id)
         );
@@ -227,8 +258,14 @@ def init_db(con: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_outcomes_due ON outcomes(status, due_at);
         CREATE INDEX IF NOT EXISTS idx_iv_history_ticker ON option_iv_history(ticker, created_at);
         CREATE INDEX IF NOT EXISTS idx_resolutions_status ON trade_resolutions(status);
+        CREATE INDEX IF NOT EXISTS idx_paper_orders_filled ON paper_orders(filled);
         """
     )
+    _ensure_columns(con, "trade_resolutions", {
+        "paper_order_id": "INTEGER",
+        "quantity": "INTEGER DEFAULT 1",
+        "fill_price": "REAL",
+    })
     _ensure_columns(con, "signals", {
         "raw_signal_score": "REAL",
         "gate_adjusted_score": "REAL",
@@ -409,7 +446,7 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
             signal_ids.append((signal_id, d.get("price")))
             direction = d.get("news_direction") or ps.get("direction")
             _record_iv_snapshot(con, run_id, signal_id, ticker, direction, opt)
-            _record_trade_resolution(con, run_id, signal_id, ticker, direction, d, opt, created)
+            _record_paper_order(con, run_id, signal_id, ticker, direction, d, opt, created)
 
         # Outcome-Zeitpunkte anlegen.
         for signal_id, start_price in signal_ids:
@@ -491,40 +528,74 @@ def _record_iv_snapshot(con: sqlite3.Connection, run_id: int, signal_id: int,
     )
 
 
-def _record_trade_resolution(con: sqlite3.Connection, run_id: int, signal_id: int,
-                             ticker: str, direction: str | None, d: dict, opt: dict,
-                             created: datetime) -> None:
-    """Legt eine offene Trade-Resolution an, sofern ein echter Optionskontrakt vorliegt.
+def _record_paper_order(con: sqlite3.Connection, run_id: int, signal_id: int,
+                        ticker: str, direction: str | None, d: dict, opt: dict,
+                        created: datetime) -> None:
+    """Simuliert eine Paper-Entry-Order, journalisiert sie und labelt NUR bei Fill.
 
-    Nur dann sinnvoll, wenn Tradier ein OCC-Symbol + Entry + Expiration geliefert hat;
-    sonst lässt sich das Outcome nicht auf Optionsebene auflösen.
+    Ablauf (siehe paper_broker für das Fill-Modell):
+      1. place_order() trifft die Fill-Entscheidung (No-Fill nur bei fehlendem Quote).
+      2. Die Order wird IMMER in paper_orders festgehalten (Fill-Rate/Audit).
+      3. Nur bei filled=True entsteht eine offene trade_resolution mit dem ECHTEN
+         simulierten Fill-Preis als entry — No-Fill erzeugt KEIN Win/Loss-Label.
+    Ohne OCC-Symbol + Expiration lässt sich nichts auflösen -> gar keine Order.
     """
+    from paper_broker import place_order
+
     opt = opt or {}
     option_symbol = opt.get("option_symbol")
-    entry = _as_float(opt.get("conservative_entry"))
-    if entry is None:
-        entry = _as_float(opt.get("entry_price"))
-    if entry is None:
-        entry = _as_float(opt.get("midpoint"))
     expiration = opt.get("expiration")
-    if not option_symbol or entry is None or entry <= 0 or not expiration:
+    if not option_symbol or not expiration:
         return
+
+    order = place_order(opt, direction or "CALL", quantity=1)
+    now_iso = iso(created)
+    con.execute(
+        """
+        INSERT OR IGNORE INTO paper_orders(
+            signal_id, run_id, ticker, option_symbol, direction, side, quantity,
+            expiration, strike, bid_at_signal, ask_at_signal, mid_at_signal, limit_price,
+            simulated_fill_price, filled, fill_reason, entry_spread_pct,
+            entry_price_vs_mid_pct, created_at, filled_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            signal_id, run_id, ticker, option_symbol, order["direction"], order["side"],
+            order["quantity"], expiration, _as_float(opt.get("strike")),
+            order["bid_at_signal"], order["ask_at_signal"], order["mid_at_signal"],
+            order["limit_price"], order["simulated_fill_price"],
+            1 if order["filled"] else 0, order["fill_reason"], order["entry_spread_pct"],
+            order["entry_price_vs_mid_pct"], now_iso,
+            now_iso if order["filled"] else None,
+        ),
+    )
+
+    if not order["filled"]:
+        return  # No Fill = kein Label
+
+    fill = _as_float(order["simulated_fill_price"])
+    if fill is None or fill <= 0:
+        return
+    row = con.execute("SELECT order_id FROM paper_orders WHERE signal_id = ?",
+                      (signal_id,)).fetchone()
+    order_id = int(row[0]) if row else None
     opt_type = "call" if str(direction).upper() == "CALL" else "put"
     con.execute(
         """
         INSERT OR IGNORE INTO trade_resolutions(
             signal_id, run_id, ticker, direction, option_symbol, expiration, strike, opt_type,
             entry_price, underlying_entry_price, tp_pct, sl_pct,
-            time_stop_hours, time_stop_required_move_pct, opened_at, status, marks_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]')
+            time_stop_hours, time_stop_required_move_pct, opened_at, status, marks_json,
+            paper_order_id, quantity, fill_price
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]', ?, ?, ?)
         """,
         (
             signal_id, run_id, ticker, direction, option_symbol, expiration,
-            _as_float(opt.get("strike")), opt_type, entry, _as_float(d.get("price")),
+            _as_float(opt.get("strike")), opt_type, fill, _as_float(d.get("price")),
             RULES.exit_take_profit_pct, RULES.exit_stop_loss_pct,
             _as_float(opt.get("time_stop_hours")),
             _as_float(opt.get("time_stop_required_move_pct")),
-            iso(created),
+            now_iso, order_id, order["quantity"], fill,
         ),
     )
 

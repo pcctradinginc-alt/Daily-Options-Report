@@ -199,8 +199,40 @@ def _compress_summary(summary: str) -> str:
 # CLAUDE CALL
 # ══════════════════════════════════════════════════════════
 
-def call_claude(summary: str, api_key: str, vix_direct=None) -> dict:
+def _apply_mandate(result: dict, mandated_ticker: str | None,
+                   mandated_direction: str | None) -> dict:
+    """Erzwingt die deterministisch getroffene Auswahl im Claude-Result.
+
+    Claude formuliert nur — die Auswahl ist gesetzt. Ohne Mandat unverändert. Selektions-
+    basiertes no_trade wird aufgehoben; harte VIX-/Budget-Stops setzt apply_vix_rules danach.
+    """
+    if not mandated_ticker:
+        return result
+    result["ticker"] = mandated_ticker
+    if mandated_direction:
+        result["direction"] = mandated_direction
+    result["no_trade"] = False
+    result["no_trade_grund"] = ""
+    return result
+
+
+def call_claude(summary: str, api_key: str, vix_direct=None,
+                mandated_ticker: str | None = None, mandated_direction: str | None = None) -> dict:
     summary = _compress_summary(summary)
+
+    # Deterministische Auswahl: der Trade ist bereits vom System bestimmt. Claude FORMULIERT
+    # nur, es ENTSCHEIDET nicht. Der Mandats-Hinweis hält den Report-Text kohärent zum
+    # gewählten Ticker; die maßgebliche Erzwingung erfolgt unten am geparsten Result.
+    user_content = "Marktdaten:\n" + summary
+    if mandated_ticker:
+        user_content += (
+            f"\n\nENTSCHEIDUNG STEHT FEST (deterministisch vom System gewählt, NICHT ändern):\n"
+            f"ticker = {mandated_ticker}, direction = {mandated_direction or 'aus Marktdaten'}.\n"
+            f"Wähle KEINEN anderen Ticker. Schreibe Strike/Laufzeit/Greeks/EV exakt aus den "
+            f"Marktdaten dieses Tickers und liefere nur die Begründung. Setze gewinner=true für "
+            f"diesen Ticker in der ticker_tabelle und no_trade=false (Ausnahme: harte VIX-/"
+            f"Datenprobleme darfst du als no_trade markieren)."
+        )
 
     try:
         r = requests.post(
@@ -214,7 +246,7 @@ def call_claude(summary: str, api_key: str, vix_direct=None) -> dict:
                 "model":      "claude-sonnet-4-6",
                 "max_tokens": 1500,
                 "system":     PROMPT,
-                "messages":   [{"role": "user", "content": "Marktdaten:\n" + summary}],
+                "messages":   [{"role": "user", "content": user_content}],
             },
             timeout=30,
         )
@@ -262,7 +294,9 @@ def call_claude(summary: str, api_key: str, vix_direct=None) -> dict:
         logger.error("Report-Pydantic-Schema-Guard: fail-closed: %s", errors[:5])
         result = build_cancelled_report("; ".join(errors[:5]), raw=text)
     else:
-        result = validated
+        # Deterministische Auswahl erzwingen: Claude darf Ticker/Richtung NICHT ändern.
+        # VIX-/Budget-Regeln bleiben über apply_vix_rules (darunter) autoritativ.
+        result = _apply_mandate(validated, mandated_ticker, mandated_direction)
 
     # Autoritativen VIX nutzen — nicht Claude-JSON-Feld
     authoritative_vix = vix_direct if vix_direct is not None else result.get("vix", "n/v")

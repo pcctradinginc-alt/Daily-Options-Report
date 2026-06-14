@@ -24,6 +24,7 @@ from simple_journal import journal
 from ml_predictor import OutcomePredictor, extract_features
 from llm_schema import validate_ticker_signal_line
 from gates import _hard_gates_ok, _enforce_gates_on_decision
+from trade_selector import select_trade
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -280,33 +281,45 @@ def main() -> int:
 
     journal.log_signals(parsed_signals, market_data, clusters)
 
-    # STEP 3: Report — Claude erstellt die Empfehlung; die Entscheidung wird HART gegen die Gates geprüft.
-    logger.info("[3/3] Report generieren...")
+    # STEP 3: Entscheidung DETERMINISTISCH (höchste Conviction unter gate-cleared), dann Report.
+    # Das LLM (Claude) FORMULIERT nur den vorbestimmten Trade — es ENTSCHEIDET ihn nicht mehr.
+    logger.info("[3/3] Deterministische Auswahl + Report...")
     try:
-        market_summary = build_summary(market_data, vix_value, ticker_directions, earnings_list, [], [])
-        data = call_claude(market_summary, cfg.get("anthropic_api_key", ""), vix_direct=vix_value)
+        selected = select_trade(market_data, gate_status)
 
-        sel_ticker = str(data.get("ticker", "")).upper()
+        if selected is None:
+            # Kein Ticker hat alle Hard-Gates bestanden -> deterministischer No-Trade, kein LLM.
+            grund = "Kein Ticker hat alle Hard-Gates bestanden"
+            logger.info("Deterministisch: %s", grund)
+            data = {"no_trade": True, "no_trade_grund": grund, "vix": vix_value}
+            journal.log_decision(data)
+            html_report = _no_trade_html(today, vix=vix_value, clusters=clusters, reason=grund)
+            _send_or_save(html_report, f"⏸️ No Trade – {today}", cfg, args.dry_run)
+        else:
+            sel_ticker = str(selected.get("ticker", "")).upper()
+            sel_dir = str(selected.get("news_direction") or selected.get("direction") or "CALL").upper()
+            logger.info("Deterministisch gewählt: %s %s (Conviction=%.1f)",
+                        sel_ticker, sel_dir, gate_status.get(sel_ticker, {}).get("conviction", 0.0))
 
-        # ML Win-Prob des gewählten Tickers in den Report übernehmen (nur bei aktivem Modell).
-        sel_status = gate_status.get(sel_ticker)
-        if sel_status and sel_status.get("ml_win_prob") is not None and predictor.is_trained():
-            data["ml_win_prob"] = sel_status["ml_win_prob"]
+            # Claude formuliert den Report für den bereits bestimmten Trade (Mandat).
+            market_summary = build_summary(market_data, vix_value, ticker_directions, earnings_list, [], [])
+            data = call_claude(market_summary, cfg.get("anthropic_api_key", ""), vix_direct=vix_value,
+                               mandated_ticker=sel_ticker, mandated_direction=sel_dir)
 
-        # C2: Harte Nachprüfung — der von Claude gewählte Ticker MUSS alle Gates bestanden haben.
-        # Erzwingt Liquidity/EV/DataQuality/Sector/Earnings-IV/News/ML deterministisch, nicht nur per Prompt.
-        was_trade = not data.get("no_trade")
-        data = _enforce_gates_on_decision(data, gate_status)
-        if was_trade and data.get("no_trade"):
-            logger.warning("Post-Claude Hard-Gate: %s blockiert -> No-Trade (%s)",
-                           sel_ticker or "?", data.get("no_trade_grund"))
+            # ML Win-Prob des gewählten Tickers in den Report übernehmen (nur bei aktivem Modell).
+            sel_status = gate_status.get(sel_ticker)
+            if sel_status and sel_status.get("ml_win_prob") is not None and predictor.is_trained():
+                data["ml_win_prob"] = sel_status["ml_win_prob"]
 
-        journal.log_decision(data)
+            # Belt&Suspenders: der gewählte Ticker IST gate-cleared (per Konstruktion); diese
+            # Prüfung fängt nur einen evtl. VIX-/Budget-No-Trade aus apply_vix_rules sauber ab.
+            data = _enforce_gates_on_decision(data, gate_status)
 
-        html_report = build_html(data, today)
-        no_trade = data.get("no_trade", False)   # C1: Subject == Body, keine Entkopplung über executed
-        subject = f"⏸️ No Trade – {today}" if no_trade else f"📊 Trade-Alarm – {today}"
-        _send_or_save(html_report, subject, cfg, args.dry_run)
+            journal.log_decision(data)
+            html_report = build_html(data, today)
+            no_trade = data.get("no_trade", False)   # C1: Subject == Body
+            subject = f"⏸️ No Trade – {today}" if no_trade else f"📊 Trade-Alarm – {today}"
+            _send_or_save(html_report, subject, cfg, args.dry_run)
     except Exception as e:
         logger.error("Report-Fehler: %s", e)
         data = {"no_trade": True, "no_trade_grund": f"Report Fehler: {e}"}

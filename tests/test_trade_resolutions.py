@@ -45,11 +45,25 @@ def _open_resolution(con, *, ticker="NVDA", direction="CALL", entry=1.00,
     return int(cur.lastrowid)
 
 
-def _patch_quotes(monkeypatch, *, option_mid=None, underlying=100.0):
+def _patch_quotes(monkeypatch, *, option_mid=None, option_bid=None, option_ask=None,
+                  underlying=100.0):
+    """Mockt Tradier-Quotes. Wenn nur option_mid gesetzt ist, fehlt 'bid' bewusst, sodass
+    resolve_open_trades auf den Mid-Fallback geht (für die State-Machine-Tests)."""
     import market_data
-    monkeypatch.setattr(market_data, "get_option_quote",
-                        lambda sym, tok, sb: ({"mid": option_mid} if option_mid is not None else None),
-                        raising=False)
+
+    def _quote(sym, tok, sb):
+        if option_mid is None and option_bid is None:
+            return None
+        q = {}
+        if option_bid is not None:
+            q["bid"] = option_bid
+        if option_ask is not None:
+            q["ask"] = option_ask
+        if option_mid is not None:
+            q["mid"] = option_mid
+        return q
+
+    monkeypatch.setattr(market_data, "get_option_quote", _quote, raising=False)
     monkeypatch.setattr(market_data, "get_quote",
                         lambda tkr, cfg: (underlying, "mock"), raising=False)
 
@@ -182,6 +196,44 @@ def test_expiry_with_prior_data_resolves(monkeypatch):
     assert row["status"] == "resolved"
     assert row["exit_reason"] == "EXPIRY"
     assert row["is_win"] == 1
+
+
+def test_exit_uses_bid_not_mid(monkeypatch):
+    """REALISMUS: Der Exit-Return wird am BID gerechnet (Long-Verkauf), nicht am Mid."""
+    import trading_journal as tj
+    con = tj.connect()
+    rid = _open_resolution(con, entry=1.00)
+    con.close()
+    # Bid 1.10 (+10%), Mid 1.25 (+25%). Beides unter TP(+50%)/SL -> Trade bleibt offen,
+    # aber der gebuchte last_return_pct MUSS aus dem Bid (+10%) stammen, nicht dem Mid.
+    _patch_quotes(monkeypatch, option_bid=1.10, option_ask=1.40, option_mid=1.25)
+
+    assert tj.resolve_open_trades({}) == 0
+    con = tj.connect()
+    row = con.execute("SELECT * FROM trade_resolutions WHERE resolution_id=?", (rid,)).fetchone()
+    con.close()
+    assert abs(row["last_return_pct"] - 10.0) < 0.5, row["last_return_pct"]   # Bid, nicht 25 (Mid)
+    assert abs(row["last_mark"] - 1.10) < 0.01
+
+
+def test_take_profit_measured_at_bid(monkeypatch):
+    """TP greift erst, wenn das BID die Schwelle erreicht — nicht schon das Mid."""
+    import trading_journal as tj
+    from rules import RULES
+    con = tj.connect()
+    rid = _open_resolution(con, entry=1.00)
+    con.close()
+    tp = RULES.exit_take_profit_pct
+    # Bid liegt klar über TP -> Win am Bid.
+    _patch_quotes(monkeypatch, option_bid=1.00 * (1 + tp + 0.10),
+                  option_ask=1.00 * (1 + tp + 0.30), option_mid=1.00 * (1 + tp + 0.20))
+
+    assert tj.resolve_open_trades({}) == 1
+    con = tj.connect()
+    row = con.execute("SELECT * FROM trade_resolutions WHERE resolution_id=?", (rid,)).fetchone()
+    con.close()
+    assert row["exit_reason"] == "TP" and row["is_win"] == 1
+    assert row["exit_return_pct"] >= tp * 100.0
 
 
 def test_expiry_without_data_marks_no_data(monkeypatch):

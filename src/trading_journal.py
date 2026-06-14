@@ -706,12 +706,22 @@ def resolve_open_trades(cfg: dict, max_marks: int = 60) -> int:
             except ValueError:
                 pass
 
-        # Aktuellen Options-Mark holen (außer abgelaufen).
+        # Aktuellen Exit-Preis holen (außer abgelaufen).
+        # REALISMUS: Ein Long-Kontrakt wird beim Schließen am BID verkauft (an den Market
+        # Maker), nicht am Mid. Exit am Mid würde jeden Win überschätzen und jeden Loss
+        # untertreiben — bei Long-Optionen mit Spread eine systematische Performance-Lüge.
+        # Fallback auf Mid/Last nur, wenn kein valides Bid vorliegt.
         mark = None
         if not expired:
             q = get_option_quote(r["option_symbol"], token, sandbox)
-            if q and q.get("mid"):
-                mark = float(q["mid"])
+            if q:
+                bid = q.get("bid")
+                if bid and bid > 0:
+                    mark = float(bid)
+                elif q.get("mid"):
+                    mark = float(q["mid"])
+                elif q.get("last"):
+                    mark = float(q["last"])
 
         # Ohne neuen Mark und nicht abgelaufen: offen lassen, nächster Lauf.
         if mark is None and not expired:

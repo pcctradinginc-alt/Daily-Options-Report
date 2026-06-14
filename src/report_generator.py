@@ -317,7 +317,21 @@ def build_html(d: dict, today: str) -> str:
                           f'Morgen läuft die Analyse erneut.</p></div>')
     else:
         einsatz   = d.get("einsatz", 150)
-        stop_loss = d.get("stop_loss_eur", round(einsatz * 0.4))
+        stop_loss = d.get("stop_loss_eur", round(einsatz * RULES.exit_stop_loss_pct))
+        sl_txt    = f"{RULES.exit_stop_loss_pct * 100:.0f}%"
+        tp_txt    = f"{RULES.exit_take_profit_pct * 100:.0f}%"
+        trail_txt = f"{RULES.exit_trailing_after_tp_pct * 100:.0f}%"
+
+        # ML Win-Probability (nur wenn vorhanden)
+        ml_row = ""
+        ml_prob = d.get("ml_win_prob")
+        if ml_prob is not None:
+            try:
+                mlp = float(ml_prob) * 100.0
+                ml_col = G if mlp >= 55 else (O if mlp >= 50 else R)
+                ml_row = row("ML Win-Prob", f"{mlp:.0f}%", ml_col)
+            except (ValueError, TypeError):
+                ml_row = ""
 
         # Richtung korrekt aus Daten lesen
         direction     = d.get("direction", "CALL")
@@ -338,12 +352,13 @@ def build_html(d: dict, today: str) -> str:
             row("Fill-Wahrscheinlichkeit", d.get("fill_probability","n/v")) +
             row("Options-EV",          str(d.get("ev_pct","n/v")) + "% / " + str(d.get("ev_dollars","n/v")) + "$") +
             row("Break-even Move",     str(d.get("breakeven_move_pct","n/v")) + "%") +
+            ml_row +
             row("Time-Stop",           d.get("time_stop", d.get("time_stop_rule", "48h: +1% Zielrichtung sonst Exit prüfen"))) +
             row("Kontrakte",           str(d.get("kontrakte","n/v"))) +
             row("Einsatz",             str(einsatz) + "€") +
-            row("Stop-Loss",           "–30% = max. " + str(stop_loss) + "€", R) +
-            row("Take-Profit 1",       "+50% → 50% verkaufen", G) +
-            row("Take-Profit 2",       "Rest mit –10% Stop", G) +
+            row("Stop-Loss",           f"–{sl_txt} = max. " + str(stop_loss) + "€", R) +
+            row("Take-Profit 1",       f"+{tp_txt} → 50% verkaufen", G) +
+            row("Take-Profit 2",       f"Rest mit –{trail_txt} Stop", G) +
             row("Unusual Activity",    "JA 🔥" if d.get("unusual") else "nein",
                 O if d.get("unusual") else DK, last=True)
         )
@@ -388,9 +403,13 @@ def build_html(d: dict, today: str) -> str:
     # ── Exit Plan mit konkreten USD-Preisen ───────────────
     exit_card = ""
     if not no_trade:
-        stop_pct = 0.30
-        tp1_pct  = 0.50
-        stop_e   = round(d.get("einsatz", 150) * stop_pct)
+        stop_pct  = RULES.exit_stop_loss_pct
+        tp1_pct   = RULES.exit_take_profit_pct
+        trail_pct = RULES.exit_trailing_after_tp_pct
+        sl_txt    = f"{stop_pct * 100:.0f}%"
+        tp_txt    = f"{tp1_pct * 100:.0f}%"
+        trail_txt = f"{trail_pct * 100:.0f}%"
+        stop_e    = round(d.get("einsatz", 150) * stop_pct)
 
         try:
             mid_f = float(str(d.get("midpoint", "0")).replace(",", "."))
@@ -405,17 +424,17 @@ def build_html(d: dict, today: str) -> str:
         if mid_f > 0:
             stop_usd   = round(mid_f * (1 - stop_pct), 2)
             tp1_usd    = round(mid_f * (1 + tp1_pct), 2)
-            tp2_usd    = round(tp1_usd * 0.90, 2)
+            tp2_usd    = round(tp1_usd * (1 - trail_pct), 2)
             cost_total = round(mid_f * 100 * kontr, 2)
             cost_str   = f"Einstieg: {mid_f:.2f} USD × {kontr} Kontrakt(e) = {cost_total:.2f} USD"
-            stop_str   = f"–30% → {stop_usd:.2f} USD (max. {stop_e}€ Verlust)"
-            tp1_str    = f"+50% → {tp1_usd:.2f} USD | 50% schließen"
-            tp2_str    = f"Rest mit –10% Stop → {tp2_usd:.2f} USD"
+            stop_str   = f"–{sl_txt} → {stop_usd:.2f} USD (max. {stop_e}€ Verlust)"
+            tp1_str    = f"+{tp_txt} → {tp1_usd:.2f} USD | 50% schließen"
+            tp2_str    = f"Rest mit –{trail_txt} Stop → {tp2_usd:.2f} USD"
         else:
             cost_str = "Einstieg: n/v"
-            stop_str = f"–30% = max. {stop_e}€"
-            tp1_str  = "+50% → 50% schließen"
-            tp2_str  = "Rest mit –10% Stop"
+            stop_str = f"–{sl_txt} = max. {stop_e}€"
+            tp1_str  = f"+{tp_txt} → 50% schließen"
+            tp2_str  = f"Rest mit –{trail_txt} Stop"
 
         exit_card = card("🎯", "#fff3e0", "Exit-Plan",
                          row("Gesamtkosten",   cost_str) +
@@ -562,6 +581,172 @@ def send_email(subject: str, html_content: str, cfg: dict) -> bool:
     except OSError as e:
         logger.error("Netzwerk-Fehler beim Email-Versand: %s", e)
         return False
+
+
+# ══════════════════════════════════════════════════════════
+# MONATLICHER WIN-RATE REPORT
+# ══════════════════════════════════════════════════════════
+
+def _fmt_rate(block: dict) -> str:
+    """'62% (n=21, CI 41–79%)' — oder '—' bei leerer Stichprobe."""
+    if not block or not block.get("n"):
+        return "—"
+    wr = block.get("win_rate")
+    if wr is None:
+        return f"n={block['n']}"
+    s = f"{wr * 100:.0f}% (n={block['n']}"
+    lo, hi = block.get("ci_low"), block.get("ci_high")
+    if lo is not None and hi is not None:
+        s += f", CI {lo * 100:.0f}–{hi * 100:.0f}%"
+    return s + ")"
+
+
+def build_monthly_winrate_html(stats: dict) -> str:
+    """Rendert den monatlichen Win-Rate-Report. Erwartet das stats-Dict aus
+    monthly_winrate_report.compute_stats(). Zeigt Stichprobengrößen + Konfidenz-
+    intervalle und ist ehrlich bei zu wenig Daten (keine Schein-Signifikanz)."""
+    G = "#34c759"; R = "#ff3b30"; O = "#ff9500"
+    GR = "#86868b"; DK = "#1d1d1f"; BG = "#f5f5f7"; WH = "#ffffff"; BD = "#e5e5ea"
+
+    def card(icon, bg, title, content):
+        return (f'<div style="background:{WH};border-radius:18px;padding:24px;margin-bottom:16px;'
+                f'box-shadow:0 2px 12px rgba(0,0,0,0.07);">'
+                f'<div style="display:flex;align-items:center;margin-bottom:16px;">'
+                f'<div style="width:34px;height:34px;background:{bg};border-radius:10px;'
+                f'text-align:center;line-height:34px;margin-right:12px;font-size:17px;">{icon}</div>'
+                f'<h2 style="margin:0;font-size:17px;font-weight:700;color:{DK};">{title}</h2>'
+                f'</div>{content}</div>')
+
+    def row(label, val, col=None, last=False):
+        b = "" if last else f"border-bottom:1px solid {BD};"
+        return (f'<div style="display:flex;justify-content:space-between;padding:9px 0;{b}">'
+                f'<span style="font-size:13px;color:{GR};">{label}</span>'
+                f'<span style="font-size:13px;font-weight:600;color:{col or DK};">{val}</span></div>')
+
+    def table(title, rows):
+        if not rows:
+            body = f'<tr><td colspan="2" style="padding:12px;color:{GR};font-size:12px;">Keine Daten</td></tr>'
+        else:
+            body = ""
+            for r in rows:
+                wr = r.get("win_rate")
+                if wr is None:
+                    wcol = DK
+                else:
+                    wcol = G if wr >= 0.55 else (O if wr >= 0.45 else R)
+                val = r.get("display") or _fmt_rate(r)
+                body += (f'<tr><td style="padding:8px 6px;font-size:12px;color:{DK};'
+                         f'border-bottom:1px solid {BD};">{r.get("label","")}</td>'
+                         f'<td style="padding:8px 6px;font-size:12px;text-align:right;color:{wcol};'
+                         f'border-bottom:1px solid {BD};">{val}</td></tr>')
+        return (f'<p style="margin:14px 0 6px 0;font-size:11px;font-weight:700;color:{GR};'
+                f'text-transform:uppercase;letter-spacing:0.05em;">{title}</p>'
+                f'<table style="width:100%;border-collapse:collapse;"><tbody>{body}</tbody></table>')
+
+    month = stats.get("month_label", "")
+    overall = stats.get("overall", {})
+    ml = stats.get("ml", {})
+
+    # Hinweis bei zu wenig Daten.
+    notice = ""
+    if stats.get("insufficient"):
+        notice = (f'<div style="background:#fff9e6;border-left:4px solid {O};border-radius:12px;'
+                  f'padding:14px 18px;margin-bottom:16px;font-size:13px;color:{DK};">⚠️ '
+                  f'Noch zu wenig abgeschlossene Trades (n={overall.get("n",0)} < '
+                  f'{stats.get("min_sample",30)}) für belastbare Aussagen. Die Zahlen sind rein '
+                  f'deskriptiv — Konfidenzintervalle sind entsprechend breit.</div>')
+
+    # Overall.
+    rec_block = overall.get("recommended", {})
+    overall_card = card("📊", "#e8f0fe", "Gesamt-Win-Rate",
+                        row("Alle aufgelösten Trades", _fmt_rate(overall),
+                            G if (overall.get("win_rate") or 0) >= 0.5 else R) +
+                        row("Nur empfohlene (versendet)", _fmt_rate(rec_block)) +
+                        row("Ø Return Gewinner", f'{overall.get("avg_win_ret","n/v")}%', G) +
+                        row("Ø Return Verlierer", f'{overall.get("avg_loss_ret","n/v")}%', R, last=True))
+
+    # ML-Impact.
+    if not ml.get("available"):
+        ml_inner = row("Status", "ML nicht verfügbar (sklearn/Modell fehlt)", GR, last=True)
+    elif not ml.get("reliable"):
+        ml_inner = row("Status", ml.get("note", "Modell noch nicht verlässlich"), O, last=True)
+    else:
+        imp = ml.get("impact_pp")
+        imp_txt = "n/v" if imp is None else f'{"+" if imp >= 0 else ""}{imp:.0f}pp'
+        imp_col = G if (imp or 0) > 0 else (R if (imp or 0) < 0 else GR)
+        ml_inner = (
+            row(f'Gefiltert (≥{int(ml.get("threshold",0.55)*100)}%)', _fmt_rate(ml.get("filtered", {})), G) +
+            row("Ungefiltert (alle)", _fmt_rate(ml.get("unfiltered", {}))) +
+            row("ML-Impact (Differenz)", imp_txt, imp_col) +
+            row("Methodik", ml.get("note", "out-of-sample/forward"), GR, last=True))
+    ml_card = card("🤖", "#f3e8ff", "ML-Mehrwert (ehrlich, out-of-sample)", ml_inner)
+
+    # Breakdown-Tabellen.
+    breakdown = card("🧭", "#f0f0f5", "Aufschlüsselung",
+                     table("Pro Monat (letzte 6)", stats.get("by_month", [])) +
+                     table("Pro Horizon", stats.get("by_horizon", [])) +
+                     table("Pro Signal-Stärke", stats.get("by_strength", [])) +
+                     table("Pro Sektor", stats.get("by_sector", [])) +
+                     table("Pro VIX-Regime", stats.get("by_regime", [])) +
+                     table("Exit-Gründe (Anteil aufgelöster Trades)", stats.get("exit_reasons", [])))
+
+    # Feature-Importances.
+    fi = stats.get("feature_importance", [])
+    if fi:
+        fi_rows = "".join(
+            row(f["feature"], f'{f["importance"]*100:.1f}%') for f in fi[:10]
+        )
+        interp = stats.get("feature_interpretation", "")
+        fi_card = card("🔬", "#e8f5e9", "Feature-Importances (Modell)",
+                       fi_rows + (f'<p style="margin:12px 0 0 0;font-size:12px;color:{GR};'
+                                  f'line-height:1.5;">{interp}</p>' if interp else ""))
+    else:
+        fi_card = card("🔬", "#e8f5e9", "Feature-Importances (Modell)",
+                       row("Status", "Noch kein trainiertes Modell", GR, last=True))
+
+    return (f'<html><head><meta charset="UTF-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1.0"></head>'
+            f'<body style="margin:0;padding:0;background:{BG};'
+            f"font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif;\">"
+            f'<div style="max-width:620px;margin:0 auto;padding:32px 16px;">'
+            f'<div style="text-align:center;margin-bottom:24px;">'
+            f'<p style="margin:0 0 6px 0;font-size:12px;font-weight:600;color:{GR};'
+            f'letter-spacing:0.08em;text-transform:uppercase;">Daily Options Report</p>'
+            f'<h1 style="margin:0 0 4px 0;font-size:28px;font-weight:700;color:{DK};">'
+            f'Monthly Win-Rate Report</h1>'
+            f'<p style="margin:0;font-size:15px;color:{GR};">{month}</p></div>'
+            f'{notice}{overall_card}{ml_card}{breakdown}{fi_card}'
+            f'<div style="text-align:center;padding:18px 0;border-top:1px solid {BD};margin-top:8px;">'
+            f'<p style="margin:0;font-size:11px;color:{GR};">Label: echte Exit-Regeln (TP/SL/Time-Stop) '
+            f'auf Optionsebene · forward-only</p></div></div></body></html>')
+
+
+def send_monthly_winrate_email(cfg: dict, stats: dict | None = None, dry_run: bool = False) -> bool:
+    """Baut den Monatsreport und verschickt ihn (oder speichert ihn im Dry-run).
+
+    Wird ohne stats lazy aus monthly_winrate_report berechnet (kein Import-Zyklus,
+    da der Import erst zur Laufzeit erfolgt)."""
+    if stats is None:
+        from monthly_winrate_report import compute_stats
+        stats = compute_stats(cfg)
+
+    html = build_monthly_winrate_html(stats)
+    ml = stats.get("ml", {})
+    impact = ml.get("impact_pp")
+    if ml.get("reliable") and impact is not None:
+        suffix = f' | ML Impact: {"+" if impact >= 0 else ""}{impact:.0f}pp'
+    elif not ml.get("available"):
+        suffix = " | ML: n/v"
+    else:
+        suffix = " | ML: noch zu wenig Daten"
+    subject = f"📈 Daily Options Report – Monthly Win-Rate {stats.get('month_label','')}{suffix}"
+
+    if dry_run:
+        with open("monthly_winrate_preview.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        logger.info("Dry-run: monthly_winrate_preview.html gespeichert (%s)", subject)
+        return True
+    return send_email(subject, html, cfg)
 
 
 # ══════════════════════════════════════════════════════════

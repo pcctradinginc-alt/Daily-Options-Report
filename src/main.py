@@ -19,8 +19,10 @@ from market_data import (
     process_ticker, get_vix, get_earnings, build_summary,
 )
 from report_generator import call_claude, build_html, send_email
-from rules import parse_ticker_signals, RULES
+from rules import parse_ticker_signals, RULES, merge_reasons
 from simple_journal import journal
+from ml_predictor import OutcomePredictor, extract_features
+from llm_schema import validate_ticker_signal_line
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -83,8 +85,46 @@ def _enrich_market_data_with_cluster_context(market_data: list, clusters: list) 
         if matches:
             best = max(matches, key=lambda c: c.get("confidence_score", 0))
             d["news_confidence_score"] = best.get("confidence_score")
+            d["news_alpha"] = best.get("news_alpha", 40)   # 0-100 (entkoppelte Katalysator-Skala)
             d["news_sentiment_score"] = best.get("sentiment_score")
             d["news_sentiment_source"] = best.get("sentiment_source", "keyword")
+
+
+def _hard_gates_ok(d: dict) -> tuple[bool, str]:
+    """Harte per-Ticker-Gates aus process_ticker — deterministisch, NICHT LLM-abhängig.
+
+    Wird nach dem Claude-Call auf den gewählten Ticker angewendet, damit Liquidity/EV/
+    DataQuality/Sector/Earnings-IV wirklich erzwungen werden (C2), nicht nur per Prompt.
+    """
+    opt = d.get("options") or {}
+    if not d.get("_data_quality_ok"):
+        return False, d.get("_data_quality_reason") or "Data-Quality fail"
+    if d.get("_liquidity_fail"):
+        return False, d.get("_liquidity_reason") or "Liquidity fail"
+    if not opt.get("ev_ok"):
+        return False, opt.get("ev_fail_reason") or "EV fail"
+    if not d.get("sector_filter_ok", True):
+        return False, d.get("sector_filter_reason") or "Sector fail"
+    if not opt.get("earnings_iv_ok", True):
+        return False, opt.get("earnings_iv_reason") or "Earnings/IV fail"
+    return True, "ok"
+
+
+def _enforce_gates_on_decision(data: dict, gate_status: dict) -> dict:
+    """C2: erzwingt, dass der von Claude gewählte Ticker alle Gates bestanden hat.
+
+    Greift NUR, wenn Claude einen Trade vorschlägt. Andernfalls fail-closed No-Trade.
+    Reine Funktion (testbar); mutiert und liefert data zurück.
+    """
+    if data.get("no_trade"):
+        return data
+    sel = str(data.get("ticker", "")).upper()
+    st = gate_status.get(sel)
+    if st is None or not st.get("cleared"):
+        why = st["reason"] if st else "Ticker nicht in geprüften Marktdaten"
+        data["no_trade"] = True
+        data["no_trade_grund"] = merge_reasons(data.get("no_trade_grund"), f"Hard-Gate {sel}: {why}")
+    return data
 
 
 # ====================== MAIN ======================
@@ -114,6 +154,18 @@ def main() -> int:
     except Exception as e:
         logger.warning("Outcome-Update übersprungen: %s", e)
 
+    try:
+        journal.resolve_open_trades(cfg)
+    except Exception as e:
+        logger.warning("Trade-Resolution übersprungen: %s", e)
+
+    # ML-Modell: bei Bedarf (re)trainieren — fail-safe, blockiert den Lauf nie.
+    predictor = OutcomePredictor()
+    try:
+        predictor.maybe_retrain()
+    except Exception as e:
+        logger.warning("ML maybe_retrain übersprungen: %s", e)
+
     # STEP 1: News
     logger.info("[1/3] News-Analyse...")
     t1 = time.monotonic()
@@ -135,6 +187,15 @@ def main() -> int:
     ticker_signals = run_claude(
         cluster_text, market_time, market_status, cfg.get("anthropic_api_key", "")
     )
+    # W7: strikter Pydantic-Schema-Guard vor dem (loseren) Parser. Fail-closed bei Formatfehler.
+    canonical, sig_errors = validate_ticker_signal_line(ticker_signals)
+    if canonical is None:
+        if sig_errors:
+            logger.warning("Signal-Schema-Guard fail-closed: %s", sig_errors[:3])
+        ticker_signals = "TICKER_SIGNALS:NONE"
+    else:
+        ticker_signals = canonical
+
     vix_value = get_vix()
     logger.info("Claude Signal: %s | VIX: %s", ticker_signals[:100], vix_value)
 
@@ -156,6 +217,7 @@ def main() -> int:
     ticker_directions = {s["ticker"]: s["direction"] for s in parsed_signals}
     tickers = list(ticker_directions.keys())
     dte_map = {s["ticker"]: s["dte_days"] for s in parsed_signals}
+    horizon_map = {s["ticker"]: s["horizon"] for s in parsed_signals}
 
     # Earnings
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -181,51 +243,100 @@ def main() -> int:
     market_data = [r for r in results if r]
     _enrich_market_data_with_cluster_context(market_data, clusters)
 
-    # === NEU: Hard-Gate Prüfung mit evaluate_trade + Position Sizing ===
-    logger.info("[2.5/3] Hard-Gate Prüfung + Position Sizing...")
-    executed = []
-    skipped = []
-
+    # === [2.5/3] Hard-Gate-Status je Ticker (deterministisch; informiert die finale Entscheidung) ===
+    logger.info("[2.5/3] Hard-Gate Prüfung + ML...")
+    ml_productive = predictor.is_productive()   # erst ab RULES.ml_reliable_min_trades (=100) Trades
+    if predictor.is_trained() and not ml_productive:
+        logger.warning("ML-Modell vorhanden, aber NICHT produktiv (%d/%d Trades) — wirkt NICHT auf "
+                       "Trades, nur Shadow-Logging",
+                       predictor.n_trades_trained(), RULES.ml_reliable_min_trades)
+    ml_version = predictor.model_version() if predictor.is_trained() else None
+    gate_status: dict[str, dict] = {}
     for d in market_data:
         ticker = d["ticker"]
-        news_alpha = d.get("news_confidence_score", 50)   # aus Cluster-Kontext
-        ticker_info = {"market_cap": 999_999_999, "price": d["price"], "spread_pct": 5.0}  # Platzhalter – später erweitern
+        news_alpha = d.get("news_alpha", 0)               # 0-100 (entkoppelte Katalysator-Skala)
+        ticker_info = {
+            "market_cap": d.get("market_cap"),             # echte MCap (Finnhub) oder None
+            "price": d["price"],
+            "spread_pct": (d.get("options") or {}).get("spread_pct"),
+        }
 
-        passed, reason = RULES.evaluate_trade(
-            ticker_info=ticker_info,
-            market_metrics=d,
-            news_alpha=news_alpha
+        ml_prob = predictor.predict_win_probability(
+            extract_features(d, vix_value, d.get("news_direction"),
+                             horizon_map.get(ticker), dte_map.get(ticker, 21))
         )
+        # Shadow-Logging der echten Modell-Vorhersage (auch wenn noch nicht produktiv).
+        d["ml_win_prob"] = ml_prob if predictor.is_trained() else None
+        d["ml_model_version"] = ml_version
+        logger.info("ML Win-Prob für %s: %.1f%% (produktiv: %s)", ticker, ml_prob * 100, ml_productive)
 
-        if passed and d.get("score", 0) >= RULES.min_score:
-            total_conviction = round(
-                (news_alpha * 0.55) + (d.get("score", 50) * 0.45), 2
-            )
-            pos_size = RULES.calculate_position_size(total_conviction, 250_000)
-
-            logger.info(f"✅ ALARM: {ticker} HIGH CONVICTION | Conviction={total_conviction} | Size=${pos_size:,.0f}")
-
-            executed.append({
-                "ticker": ticker,
-                "direction": d.get("news_direction"),
-                "conviction": total_conviction,
-                "position_size": pos_size,
-                "reason": "All gates passed"
-            })
+        passed, reason = RULES.evaluate_trade(ticker_info, d, news_alpha)
+        hard_ok, hard_reason = _hard_gates_ok(d)
+        score_ok = d.get("score", 0) >= RULES.min_score
+        # ML wirkt NUR bei produktivem Modell: weicher Conviction-Boost + Hard-Block nur bei sehr
+        # niedriger Wahrscheinlichkeit. Sonst inert (kein Boost, kein Gate).
+        if ml_productive:
+            ml_ok, ml_reason = RULES.ml_gate_ok(ml_prob)
+            conv_bonus = RULES.ml_conviction_bonus(ml_prob)
         else:
-            skipped.append({"ticker": ticker, "reason": reason})
+            ml_ok, ml_reason, conv_bonus = True, "ML nicht produktiv", 0.0
+
+        if not passed:
+            block = reason
+        elif not hard_ok:
+            block = hard_reason
+        elif not score_ok:
+            block = f"Score {d.get('score', 0)} < {RULES.min_score}"
+        elif not ml_ok:
+            block = ml_reason
+        else:
+            block = "ok"
+        cleared = passed and hard_ok and score_ok and ml_ok
+
+        conviction = 0.0
+        if cleared:
+            conviction = round(
+                news_alpha * RULES.conviction_news_weight
+                + d.get("score", 50) * RULES.conviction_score_weight
+                + conv_bonus, 2
+            )
+            logger.info("✅ Gate clear: %s | Conviction=%.1f | ML=%.0f%%", ticker, conviction, ml_prob * 100)
+        else:
+            logger.info("⛔ Gate block: %s | %s", ticker, block)
+
+        gate_status[ticker] = {"cleared": cleared, "reason": block,
+                               "conviction": conviction, "ml_win_prob": ml_prob}
+
+    cleared_tickers = [t for t, s in gate_status.items() if s["cleared"]]
+    logger.info("Gate-cleared Ticker: %s", cleared_tickers or "keine")
 
     journal.log_signals(parsed_signals, market_data, clusters)
 
-    # STEP 3: Report
+    # STEP 3: Report — Claude erstellt die Empfehlung; die Entscheidung wird HART gegen die Gates geprüft.
     logger.info("[3/3] Report generieren...")
     try:
         market_summary = build_summary(market_data, vix_value, ticker_directions, earnings_list, [], [])
         data = call_claude(market_summary, cfg.get("anthropic_api_key", ""), vix_direct=vix_value)
+
+        sel_ticker = str(data.get("ticker", "")).upper()
+
+        # ML Win-Prob des gewählten Tickers in den Report übernehmen (nur bei aktivem Modell).
+        sel_status = gate_status.get(sel_ticker)
+        if sel_status and sel_status.get("ml_win_prob") is not None and predictor.is_trained():
+            data["ml_win_prob"] = sel_status["ml_win_prob"]
+
+        # C2: Harte Nachprüfung — der von Claude gewählte Ticker MUSS alle Gates bestanden haben.
+        # Erzwingt Liquidity/EV/DataQuality/Sector/Earnings-IV/News/ML deterministisch, nicht nur per Prompt.
+        was_trade = not data.get("no_trade")
+        data = _enforce_gates_on_decision(data, gate_status)
+        if was_trade and data.get("no_trade"):
+            logger.warning("Post-Claude Hard-Gate: %s blockiert -> No-Trade (%s)",
+                           sel_ticker or "?", data.get("no_trade_grund"))
+
         journal.log_decision(data)
 
         html_report = build_html(data, today)
-        no_trade = data.get("no_trade", False) or len(executed) == 0
+        no_trade = data.get("no_trade", False)   # C1: Subject == Body, keine Entkopplung über executed
         subject = f"⏸️ No Trade – {today}" if no_trade else f"📊 Trade-Alarm – {today}"
         _send_or_save(html_report, subject, cfg, args.dry_run)
     except Exception as e:
@@ -234,8 +345,8 @@ def main() -> int:
         journal.log_decision(data)
         _send_or_save(_error_html(str(e), today), f"⚠️ Report Fehler – {today}", cfg, args.dry_run)
 
-    logger.info("✅ Gesamtlauf beendet in %.1fs | Executed: %d | Skipped: %d",
-                time.monotonic() - t_start, len(executed), len(skipped))
+    logger.info("✅ Gesamtlauf beendet in %.1fs | Gate-cleared: %d/%d",
+                time.monotonic() - t_start, len(cleared_tickers), len(market_data))
     return 0
 
 

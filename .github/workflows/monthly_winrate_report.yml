@@ -1,25 +1,25 @@
-name: Daily Options Report
+name: Monthly Win-Rate Report
 
 on:
   schedule:
-    # ca. 11:45 ET (15:45 UTC) — Mo–Fr
-    - cron: '45 15 * * 1-5'
+    # 1. des Monats, 09:00 UTC
+    - cron: '0 9 1 * *'
 
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry-run (kein Email-Versand)'
+        description: 'Dry-run (kein Email-Versand, nur HTML)'
         required: false
         default: 'false'
         type: choice
         options: ['false', 'true']
 
 concurrency:
-  group: daily-options-report
+  group: monthly-winrate-report
   cancel-in-progress: false
 
 jobs:
-  run-bot:
+  winrate-report:
     runs-on: ubuntu-latest
 
     steps:
@@ -35,12 +35,13 @@ jobs:
       - name: data-Ordner erstellen
         run: mkdir -p data
 
+      # Liest den geteilten Cache, den der Daily-Job (gleiches Key-Präfix) gefüllt hat:
+      # enthält trading_journal.sqlite + ml_outcome_model.joblib.
       - name: Journal + ML-Modell aus Cache laden
-        id: journal-cache
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: trading-journal-${{ runner.os }}-${{ github.run_id }}
+          key: trading-journal-${{ runner.os }}-monthly-${{ github.run_id }}
           restore-keys: |
             trading-journal-${{ runner.os }}-
 
@@ -49,39 +50,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Bot ausführen
+      - name: Monatsreport erstellen + versenden
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TRADIER_TOKEN:     ${{ secrets.TRADIER_TOKEN }}
           TRADIER_SANDBOX:   "false"
-          FINNHUB_KEY:       ${{ secrets.FINNHUB_KEY }}
-          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
           GMAIL_RECIPIENT:   ${{ secrets.GMAIL_RECIPIENT }}
           SMTP_SENDER:       ${{ secrets.SMTP_SENDER }}
           SMTP_PASSWORD:     ${{ secrets.SMTP_PASSWORD }}
-          SEC_USER_AGENT:    ${{ secrets.SEC_USER_AGENT }}
         run: |
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            python src/main.py --dry-run --verbose
+            python src/monthly_winrate_report.py --dry-run
           else
-            python src/main.py --verbose
+            python src/monthly_winrate_report.py
           fi
 
-      - name: Journal + ML-Modell zurück in Cache speichern
-        if: always() && hashFiles('data/trading_journal.sqlite') != ''
-        uses: actions/cache/save@v4
-        with:
-          path: data
-          key: trading-journal-${{ runner.os }}-${{ github.run_id }}
-
-      - name: Journal + Modell als Artifact sichern
+      - name: HTML-Vorschau als Artifact sichern
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trading-journal-${{ github.run_number }}
-          path: |
-            data/trading_journal.sqlite
-            data/ml_outcome_model.joblib
-            data/ml_feature_names.json
+          name: monthly-winrate-${{ github.run_number }}
+          path: monthly_winrate_preview.html
           retention-days: 90
           if-no-files-found: ignore

@@ -23,6 +23,11 @@ class TradingRules:
     einsatz_reduced: int = 150
     # Risiko
     stop_loss_pct: float = 0.30
+    # Exit-Regeln der Trade-Empfehlung (zentral, damit Email-Anzeige UND Outcome-Label
+    # auf identischen Schwellen arbeiten). Beziehen sich auf den Optionspreis.
+    exit_take_profit_pct: float = 0.50      # +50% -> Take-Profit 1
+    exit_stop_loss_pct: float = 0.30        # -30% -> Stop-Loss
+    exit_trailing_after_tp_pct: float = 0.10  # Rest mit -10% Trailing-Stop
     # Score-Schwellen
     research_min_score: int = 50
     min_score: int = 65
@@ -48,6 +53,12 @@ class TradingRules:
     min_option_ev_pct: float = 12.0
     min_option_ev_dollars: float = 12.0
     ev_hold_days: int = 2
+    # Anteil des erwarteten Moves, der als gerichteter EV-Gain zählt. <1.0, weil die Richtung
+    # nicht sicher ist (Pfad-/Richtungsunsicherheit). Konservativer Proxy gegen optimistisches EV.
+    ev_directional_capture: float = 0.6
+    # Vega-Konvention: Tradier/ORATS liefern Vega pro 1 Vol-Punkt (1%). iv_drop ist in Dezimal-IV,
+    # daher *100 auf Vol-Punkte. Falls Vega ausnahmsweise pro 1.00 (100%) käme, auf 1.0 setzen.
+    vega_iv_points_per_unit: float = 100.0
     # IV-/Earnings-Schutz
     earnings_window_days: int = 10
     block_long_options_if_earnings_soon: bool = True
@@ -95,13 +106,29 @@ class TradingRules:
     max_spread_pct: float = 8.0               # Max Spread (konservativ)
     min_news_alpha: int = 55                  # Mindest-Confidence aus news_analyzer
 
-    def evaluate_trade(self, ticker_info: dict, market_metrics: dict, news_alpha: float):
-        """Das ultimative Filter-System (Hard Gates)."""
-        # 1. Grundlegende Filter
-        if ticker_info.get('market_cap', 0) < self.min_market_cap:
-            return False, f"Market Cap too low ({ticker_info.get('market_cap')})"
+    # === ML Outcome-Predictor (weiches Gate, überschreibt NIE harte Gates) ===
+    ml_min_win_prob: float = 0.52             # Referenz/Report-Schwelle (kein hartes Gate mehr)
+    ml_hard_block_prob: float = 0.35          # NUR darunter hartes No-Trade (Kapitalschutz)
+    ml_reliable_min_trades: int = 100         # produktiv erst ab so vielen aufgelösten Trades
+    ml_conviction_weight: float = 12.0        # max. Conviction-Punkte aus ML (zentriert um 0.5)
 
-        if ticker_info.get('price', 0) < self.min_price:
+    # === Entscheidungs-/Sizing-Konstanten (vorher Magic Numbers in main.py) ===
+    conviction_news_weight: float = 0.55      # Gewicht news_alpha (0-100) in der Conviction
+    conviction_score_weight: float = 0.45     # Gewicht Markt-Score (0-100) in der Conviction
+    account_value_usd: float = 250_000        # Referenz für calculate_position_size (%-Risk-Modus)
+
+    def evaluate_trade(self, ticker_info: dict, market_metrics: dict, news_alpha: float):
+        """Das ultimative Filter-System (Hard Gates).
+
+        market_cap und spread_pct sind fail-open: fehlt der Wert (None), wird das jeweilige
+        Gate übersprungen, statt blind zu blocken — Liquidität/EV werden separat hart geprüft.
+        """
+        # 1. Grundlegende Filter
+        market_cap = ticker_info.get('market_cap')
+        if market_cap is not None and market_cap < self.min_market_cap:
+            return False, f"Market Cap too low ({market_cap})"
+
+        if (ticker_info.get('price') or 0) < self.min_price:
             return False, f"Price below threshold ({ticker_info.get('price')})"
 
         # 2. News-Qualität Filter
@@ -113,13 +140,19 @@ class TradingRules:
             return False, "No Volume/Gap Confirmation"
 
         # 4. Spread Check
-        if ticker_info.get('spread_pct', 0) > self.max_spread_pct:
-            return False, f"Spread too wide ({ticker_info.get('spread_pct')}%)"
+        spread_pct = ticker_info.get('spread_pct')
+        if spread_pct is not None and spread_pct > self.max_spread_pct:
+            return False, f"Spread too wide ({spread_pct}%)"
 
         return True, "All Filters Passed"
 
-    def calculate_position_size(self, confidence_score: float, account_value: float) -> float:
-        """Dynamisches Risk-Management basierend auf Conviction."""
+    def calculate_position_size(self, confidence_score: float, account_value: float,
+                                ml_win_prob: float | None = None) -> float:
+        """Dynamisches Risk-Management basierend auf Conviction.
+
+        Optionaler ML-Tilt: hohe Win-Wahrscheinlichkeit erhöht das Risiko leicht,
+        niedrige senkt es. Bleibt konservativ geklammert und überschreibt nie ein Gate.
+        """
         if confidence_score >= 85:
             risk_pct = 0.05   # 5% für Top-Signale
         elif confidence_score >= 72:
@@ -129,7 +162,39 @@ class TradingRules:
         else:
             risk_pct = 0.01   # 1% für marginale Setups
 
+        if ml_win_prob is not None:
+            tilt = max(-0.20, min(0.20, float(ml_win_prob) - 0.5))  # ±0.2 um 0.5
+            risk_pct = risk_pct * (1.0 + tilt)
+            risk_pct = max(0.005, min(0.06, risk_pct))
+
         return round(account_value * risk_pct, 2)
+
+    # ── ML-Hilfen (weich) ─────────────────────────────────────────────
+    def ml_conviction_bonus(self, ml_win_prob: float | None) -> float:
+        """Conviction-Punkte aus der ML-Wahrscheinlichkeit, zentriert um 0.5.
+
+        0.5 -> 0, 1.0 -> +ml_conviction_weight, 0.0 -> -ml_conviction_weight.
+        """
+        if ml_win_prob is None:
+            return 0.0
+        try:
+            p = float(ml_win_prob)
+        except (TypeError, ValueError):
+            return 0.0
+        return round((p - 0.5) * 2.0 * self.ml_conviction_weight, 2)
+
+    def ml_gate_ok(self, ml_win_prob: float | None) -> tuple[bool, str]:
+        """Hartes ML-Gate NUR bei sehr niedriger Wahrscheinlichkeit (Kapitalschutz).
+
+        Ansonsten wirkt ML rein weich über ml_conviction_bonus. Wird in main.py nur bei
+        PRODUKTIVEM Modell (>= ml_reliable_min_trades Trades) überhaupt angewandt und
+        überschreibt nie die harten Gates (VIX/Liquidity/EV/DataQuality/Earnings-IV).
+        """
+        if ml_win_prob is None:
+            return True, "ML-Wahrscheinlichkeit fehlt — durchgelassen"
+        if float(ml_win_prob) < self.ml_hard_block_prob:
+            return False, f"ML Win-Prob {float(ml_win_prob)*100:.0f}% < {self.ml_hard_block_prob*100:.0f}% (Hard-Block)"
+        return True, "ML ok"
 
 
 # Globale Instanz

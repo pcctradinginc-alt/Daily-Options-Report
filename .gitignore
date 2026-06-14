@@ -8,8 +8,15 @@ venv/
 logs/
 *.log
 report_preview.html
+monthly_winrate_preview.html
 market_summary.txt
 signals.txt
+# Runtime-Daten & ML-Artefakte (via Actions-Cache persistiert, nicht committen)
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/ml_outcome_model.joblib
+data/ml_feature_names.json
 .DS_Store
 .idea/
 .vscode/

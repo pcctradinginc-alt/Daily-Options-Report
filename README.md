@@ -11,10 +11,11 @@ eine HTML-Email mit konkreten Handelsempfehlungen.
 
 ```
 1. News-Analyse
-   14 RSS-Feeds (Reuters, Bloomberg, CNBC, Benzinga) parallel.
-   Artikel werden geclustert und mit gewichtetem Score bewertet
-   (Aktualität × Quellen-Qualität × Velocity × Earnings-Proximity).
-   Claude analysiert Top-Cluster → handelbare Signale.
+   ~10 RSS-Feeds (Bloomberg, CNBC, Benzinga, Yahoo, MarketWatch, WSJ, FT, SEC) parallel.
+   Artikel werden je Ticker geclustert und nach Katalysator-Typ bewertet
+   (FDA, Merger, 8-K/13D/Form-4, Wire) → News-Alpha 0–100.
+   Claude wählt aus den Top-Clustern → handelbare Signale.
+   (Earnings-Nähe ist KEIN Score-Bonus, sondern ein Risiko-Gate; siehe Schritt 2.)
 
 2. Marktdaten
    Kurse (AlphaVantage → Yahoo → Finnhub), historische Daten
@@ -112,6 +113,50 @@ Manueller Start: Actions → Daily Options Report → Run workflow
 | < 20 | 250 € | ✅ Normal |
 
 Ausschluss wenn: Score < 50 · Δ% gegen Signal · unter MA50 · Spread > 2% · OI < 5.000
+
+---
+
+## Machine Learning Outcome Predictor
+
+Optionales ML-Modul, das die Trefferrate der empfohlenen Trades verbessern soll.
+Es ist bewusst **weich** und **fail-safe**: Fehlt das Modell oder sklearn, läuft der Bot
+unverändert weiter.
+
+**Faithful Label (echte Exit-Regeln).** Jeder empfohlene/bewertete Trade mit echtem
+Optionskontrakt wird in `trade_resolutions` verfolgt. Bei jedem Lauf wird der aktuelle
+Options-Mark (Tradier) geholt und die **Exit-Regeln der Empfehlung** aufgelöst:
+Take-Profit (+50 %), Stop-Loss (−30 %), Time-Stop und Expiry. Das Label `is_win` spiegelt
+also den realen Trade-Ausgang wider — nicht nur die Underlying-Bewegung. Granularität:
+1 Mark pro Lauf (tagesgenau), forward-only; vergangene Trades werden nicht nachgelabelt.
+
+**Modell.** `src/ml_predictor.py` trainiert einen `RandomForestClassifier` (flach gehalten
+gegen Overfitting) auf 27 Decision-Zeitpunkt-Features (Score, EV, IV/RV, IV-Rank, Gap/RVol,
+Sektor-Momentum, News-Confidence/Sentiment, VIX, Direction, Horizon, DTE …). Gespeichert als
+`data/ml_outcome_model.joblib` + `data/ml_feature_names.json`. Retraining automatisch ab 50
+aufgelösten Trades, danach alle 7 Tage oder bei ≥ 20 neuen Outcomes.
+
+**Tägliche Wirkung (weich).** In Schritt 2.5 berechnet der Bot pro Ticker eine Win-
+Wahrscheinlichkeit. Sie fließt als Conviction-Bonus und (erst ab `ml_reliable_min_trades`
+aufgelösten Trades) als zusätzliches Gate `ml_win_prob ≥ 0.52` ein. **Harte Gates
+(VIX, Liquidität, EV, Datenqualität, Earnings-IV) werden nie überschrieben.**
+
+**Monatlicher Win-Rate-Report.** Am 1. des Monats (`monthly_winrate_report.yml`) kommt eine
+E-Mail mit Gesamt-Win-Rate (inkl. Wilson-Konfidenzintervallen), Win-Rate pro Monat/Horizon/
+Stärke/Sektor, **ML-gefiltert vs. ungefiltert** (forward/out-of-sample) und Feature-Importances.
+Bei zu wenig Daten zeigt der Report transparent „noch zu wenig Trades" statt Schein-Signifikanz.
+
+```bash
+# Modell manuell trainieren (sobald genug Daten da sind)
+python src/ml_predictor.py --train
+python src/ml_predictor.py --info          # Status + Feature-Importances
+
+# Monatsreport testen (kein Email-Versand, schreibt monthly_winrate_preview.html)
+python src/monthly_winrate_report.py --dry-run
+```
+
+> Realistische Erwartung: Bei ~1 Trade/Tag dauert es Monate, bis genügend unabhängige,
+> aufgelöste Trades für ein belastbares Modell vorliegen. Bis dahin ist das ML-Gate inaktiv
+> und der Report weist die dünne Datenlage offen aus.
 
 ---
 

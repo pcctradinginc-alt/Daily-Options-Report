@@ -53,6 +53,16 @@ CATALYST_WEIGHTS = {
     "news_standard": 0.95,
 }
 
+# News-Alpha 0-100 je Katalysator-Typ. Bewusst entkoppelt von der internen, krummen
+# confidence_score-Skala (~5-22), damit das Hard-Gate (min_news_alpha) und die Conviction
+# auf einer interpretierbaren 0-100-Skala arbeiten.
+EVENT_ALPHA = {
+    "fda_approval": 85, "phase_3": 80, "merger": 82, "acquisition": 82,
+    "activist_entry": 80, "guidance_raise": 75, "earnings_beat": 72,
+    "8k_material_event": 70, "insider_filing": 60, "wire_strong": 60,
+    "buyback": 58, "passive_stake": 55, "sec_filing": 50, "news_standard": 40,
+}
+
 # ==================== SYSTEM PROMPT ====================
 SYSTEM_PROMPT = """Du bist ein hochdisziplinierter Options-Trading-Bot.
 
@@ -83,8 +93,7 @@ _FEED_HEADERS = {
 
 # ==================== RSS FEEDS ====================
 RSS_FEEDS = [
-    "https://feeds.reuters.com/reuters/businessNews",
-    "https://feeds.reuters.com/reuters/technologyNews",
+    # Hinweis: Reuters hat seine öffentlichen RSS-Feeds eingestellt -> entfernt (W5).
     "https://www.benzinga.com/feed",
     "https://rss.cnbc.com/id/100003114",
     "https://rss.cnbc.com/id/100727362",
@@ -108,6 +117,13 @@ _WIRE_TICKER_RE = re.compile(
     re.IGNORECASE
 )
 _WIRE_SOURCES = ("globenewswire", "businesswire", "prnewswire", "newswire", "accesswire")
+_CASHTAG_RE = re.compile(r"\$([A-Z]{1,5})\b")
+# Häufige Kurzwörter, die als 2-3-Buchstaben-Ticker false-positive matchen würden.
+_TICKER_STOPWORDS = {
+    "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL", "NEW", "CEO", "CFO",
+    "USA", "GDP", "FED", "SEC", "ETF", "IPO", "AI", "IT", "ON", "OR", "SO", "GO",
+    "BE", "AT", "AS", "IN", "OF", "TO", "IS", "BY", "UP", "WHO", "NOW", "OUT", "DAY",
+}
 
 # ==================== HELPERS ====================
 def _score_catalyst(event_type: str, base_conf: float = 5.0) -> float:
@@ -238,16 +254,34 @@ def _resolve_wire_ticker(article: dict) -> Optional[str]:
 
 
 def _resolve_ticker_from_headline(title: str, summary: str = "") -> Optional[str]:
+    """Robuste Ticker-Auflösung aus dem Headline-Text (W2).
+
+    Reihenfolge: (1) Cashtag $TICKER, (2) Wortgrenzen-Match über bekannte Ticker (>=3
+    Zeichen, längste zuerst, deterministisch), (3) Firmenname. 1-2-Buchstaben-Ticker
+    im Klartext werden bewusst NICHT gematcht — Substring-/Kurzwort-Treffer (ON, IT, GO,
+    BE ...) führen sonst zum Handel des falschen Wertes. Sie sind nur via Cashtag erreichbar.
+    """
     text = (title + " " + summary).upper()
     known = _load_known_tickers()
 
-    for t in known:
-        if t in text and len(t) >= 2:
+    # 1) Cashtag (stärkstes, eindeutiges Signal) — auch 1-2-Buchstaben erlaubt.
+    for m in _CASHTAG_RE.finditer(text):
+        cand = m.group(1)
+        if cand in _TICKER_STOPWORDS:
+            continue
+        if not known or cand in known:
+            return cand
+
+    # 2) Wortgrenzen-Match, längste Ticker zuerst, deterministisch sortiert.
+    for t in sorted((x for x in known if len(x) >= 3 and x not in _TICKER_STOPWORDS),
+                    key=lambda s: (-len(s), s)):
+        if re.search(rf"\b{re.escape(t)}\b", text):
             return t
 
+    # 3) Firmenname -> Ticker (längste Namen zuerst, um Teilstring-Kollisionen zu vermeiden).
     name_map = _load_name_to_ticker()
-    for name, ticker in name_map.items():
-        if name.upper() in text:
+    for name, ticker in sorted(name_map.items(), key=lambda kv: -len(kv[0])):
+        if name and name.upper() in text:
             return ticker
     return None
 
@@ -289,6 +323,7 @@ def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
             ticker_signals[ticker] = {
                 "ticker": ticker,
                 "confidence_score": round(conf, 2),
+                "news_alpha": EVENT_ALPHA.get(event_type, 40),   # 0-100, fürs Hard-Gate + Conviction
                 "event_type": event_type,
                 "headline_repr": art["title"][:120],
                 "sentiment_score": 0.0,

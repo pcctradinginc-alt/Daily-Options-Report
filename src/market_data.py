@@ -26,7 +26,7 @@ from rules import (
 from market_calendar import market_elapsed_fraction
 from data_validator import (
     validate_ohlcv_history, detect_unexplained_price_spike,
-    data_flags_to_text, realized_volatility,
+    data_flags_to_text,
 )
 from sector_map import evaluate_sector_filter
 
@@ -93,6 +93,43 @@ def get_quote_tradier(symbol, tradier_token, sandbox=False):
                 round(float(high), 2), round(float(low), 2), "tradier_sandbox" if sandbox else "tradier_production")
     except (ValueError, KeyError, RequestException) as e:
         logger.debug("Tradier quote %s: %s", symbol, e)
+        return None
+
+
+def get_option_quote(option_symbol, tradier_token, sandbox=False):
+    """Aktueller Markt-Mark eines einzelnen Optionskontrakts (OCC-Symbol).
+
+    Wird vom Outcome-Tracking genutzt, um die Exit-Regeln (TP/SL/Time-Stop) auf
+    dem real gehandelten Kontrakt statt nur am Underlying aufzulösen.
+    Rückgabe: dict mit bid/ask/last/mid oder None bei Fehler.
+    """
+    if not option_symbol or not tradier_token:
+        return None
+    try:
+        base = "https://sandbox.tradier.com" if sandbox else "https://api.tradier.com"
+        hdrs = {"Authorization": "Bearer " + tradier_token, "Accept": "application/json"}
+        r = robust_get(base + "/v1/markets/quotes",
+                       params={"symbols": option_symbol, "greeks": "false"},
+                       headers=hdrs)
+        if not r:
+            return None
+        q = (r.json().get("quotes") or {}).get("quote")
+        if isinstance(q, list):
+            q = q[0] if q else None
+        if not q:
+            return None
+        bid_f = _safe_float(q.get("bid"))
+        ask_f = _safe_float(q.get("ask"))
+        last_f = _safe_float(q.get("last"))
+        if bid_f > 0 and ask_f > 0 and ask_f >= bid_f:
+            mid = round((bid_f + ask_f) / 2.0, 4)
+        elif last_f > 0:
+            mid = round(last_f, 4)
+        else:
+            return None
+        return {"bid": bid_f, "ask": ask_f, "last": last_f, "mid": mid}
+    except (ValueError, KeyError, RequestException) as e:
+        logger.debug("Tradier option quote %s: %s", option_symbol, e)
         return None
 
 
@@ -186,6 +223,31 @@ def get_quote_finnhub(symbol, api_key):
                 "finnhub")
     except (ValueError, KeyError, RequestException) as e:
         logger.debug("Finnhub %s: %s", symbol, e)
+        return None
+
+
+def get_market_cap(symbol, finnhub_key):
+    """Marktkapitalisierung in USD via Finnhub /stock/profile2.
+
+    Finnhub liefert marketCapitalization in Mio. der Heimatwährung -> *1e6 für USD.
+    Fail-open: None bei fehlendem Key, Fehler oder unbekanntem Wert (z. B. viele ETFs).
+    """
+    if not finnhub_key:
+        return None
+    try:
+        r = robust_get("https://finnhub.io/api/v1/stock/profile2",
+                       params={"symbol": symbol, "token": finnhub_key})
+        if not r:
+            return None
+        mc = r.json().get("marketCapitalization")
+        if mc is None:
+            return None
+        mc = float(mc)
+        if mc <= 0:
+            return None
+        return mc * 1_000_000.0
+    except (ValueError, KeyError, RequestException) as e:
+        logger.debug("Finnhub market cap %s: %s", symbol, e)
         return None
 
 
@@ -368,7 +430,8 @@ def _safe_float(value, default=0.0) -> float:
 def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
                        expected_move_pct: float, realized_vol_20d: float | None = None,
                        earnings_soon: bool = False, news_driven: bool = False,
-                       iv_percentile: float | None = None) -> dict | None:
+                       iv_percentile: float | None = None,
+                       dte_days: int | None = None) -> dict | None:
     g = option.get("greeks") or {}
     bid = _safe_float(option.get("bid"))
     ask = _safe_float(option.get("ask"))
@@ -396,8 +459,9 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
         return None
 
     move_abs = underlying_price * expected_move_pct / 100.0
-    delta_gain = abs(delta) * move_abs
-    gamma_gain = 0.5 * abs(gamma) * (move_abs ** 2) * 0.6   # gedämpft
+    # C4: nur ein Teil des erwarteten Moves zählt als gerichteter Gain (Richtung ist nicht sicher).
+    delta_gain = abs(delta) * move_abs * RULES.ev_directional_capture
+    gamma_gain = 0.5 * abs(gamma) * (move_abs ** 2) * 0.6   # gedämpft; Konvexität (immer günstig)
     theta_cost = abs(theta) * RULES.ev_hold_days if theta else 0.0
 
     iv_drop_decimal = 0.0
@@ -422,7 +486,10 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
         iv_drop_decimal = iv * crush_pct
         iv_crush_factor_used = crush_pct
 
-    vega_cost = abs(vega) * iv_drop_decimal
+    # C3: Tradier/ORATS-Vega ist pro 1 Vol-Punkt (1%). iv_drop_decimal ist in Dezimal-IV,
+    # daher * vega_iv_points_per_unit (=100) auf Vol-Punkte. Ohne diese Korrektur wäre der
+    # IV-Crush-Kostenblock ~100x zu klein.
+    vega_cost = abs(vega) * iv_drop_decimal * RULES.vega_iv_points_per_unit
 
     entry_slippage = max(0.0, entry - mid)
     exit_slip = exit_slippage_points(opt_data)
@@ -453,8 +520,13 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
         ev_reasons.append(f"EV% {ev_pct} < {RULES.min_option_ev_pct}")
     if ev_dollars < RULES.min_option_ev_dollars:
         ev_reasons.append(f"EV$ {ev_dollars} < {RULES.min_option_ev_dollars}")
-    if breakeven_move_pct > expected_move_pct * 1.25:
-        ev_reasons.append("Break-even-Move zu hoch")
+    # W1: Break-even ist ein At-Expiry-Konzept -> gegen die bis Expiry erwartete Bewegung prüfen,
+    # nicht gegen den kurzen Hold-Horizont-Move. Ohne RV/DTE wird das Gate übersprungen.
+    exp_move_to_expiry = None
+    if realized_vol_20d and realized_vol_20d > 0 and dte_days and dte_days > 0:
+        exp_move_to_expiry = realized_vol_20d * math.sqrt(dte_days / 252.0) * 100.0
+    if exp_move_to_expiry and breakeven_move_pct > exp_move_to_expiry * 1.25:
+        ev_reasons.append("Break-even-Move > erwartete Bewegung bis Expiry")
     if fill_p < RULES.min_fill_probability:
         ev_reasons.append(f"FillP {fill_p} < {RULES.min_fill_probability}")
 
@@ -500,6 +572,7 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
         "ev_ok": ev_ok,
         "ev_fail_reason": merge_reasons(ev_reasons),
         "option_source": "tradier",
+        "option_symbol": option.get("symbol"),
         "contracts": None,
     }
 
@@ -617,7 +690,8 @@ def get_tradier_options(symbol, direction, tradier_token,
             ev = evaluate_option_ev(opt, direction, underlying_price, expected_move_pct,
                                     realized_vol_20d=rv20,
                                     earnings_soon=earnings_soon,
-                                    news_driven=True)
+                                    news_driven=True,
+                                    dte_days=target_days)
             if ev is None:
                 continue
             ev["expiration"] = target_exp
@@ -789,6 +863,7 @@ def process_ticker(ticker, direction, earnings_list, cfg, target_dte: int = 21) 
         if is_etf and price <= 0:
             return {
                 "ticker": ticker, "price": 0.0, "change_pct": 0.0,
+                "market_cap": None,
                 "score": 0.0, "_score_reason": "etf_no_price",
                 "options": {}, "news_direction": direction,
                 "is_etf": True, "etf_no_data": True,
@@ -828,6 +903,8 @@ def process_ticker(ticker, direction, earnings_list, cfg, target_dte: int = 21) 
             recent_high = max(closes[-20:])
             new_20d = price >= recent_high * 0.98 if recent_high > 0 else None
         earnings_soon = ticker in earnings_list
+        # Marktkapitalisierung für das Hard-Gate (ETFs haben keine sinnvolle MCap -> None).
+        market_cap = None if is_etf else get_market_cap(ticker, finnhub_key)
 
         gap_bonus = gap_volume["score_bonus"] if data_validation_ok else 0.0
 
@@ -906,6 +983,7 @@ def process_ticker(ticker, direction, earnings_list, cfg, target_dte: int = 21) 
         return {
             "ticker": ticker,
             "price": price,
+            "market_cap": market_cap,
             "change_pct": change_pct,
             "rel_vol": str(rel_vol) if rel_vol is not None else "n/v",
             "rel_vol_quality": "daily_only_no_intraday_curve",

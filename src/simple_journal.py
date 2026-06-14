@@ -7,6 +7,7 @@ from trading_journal import (
     log_market_signals,
     log_final_decision,
     update_due_outcomes,
+    resolve_open_trades,
     get_iv_stats
 )
 
@@ -36,6 +37,10 @@ class TradingJournal:
     def update_outcomes(self, cfg):
         """Fällige Outcomes updaten"""
         return update_due_outcomes(cfg)
+
+    def resolve_open_trades(self, cfg):
+        """Offene Trades anhand der Exit-Regeln auf Optionsebene auflösen (faithful Label)"""
+        return resolve_open_trades(cfg)
 
     def get_iv_stats(self, ticker: str, current_iv: float | None = None):
         """IV-Rank aus eigener Historie"""

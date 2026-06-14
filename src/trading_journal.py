@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from rules import RULES
+
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -50,7 +52,10 @@ def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(db_path, timeout=10)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
+    # DELETE statt WAL: Single-Writer-Batch-Prozess. Vermeidet, dass ungecheckpointete
+    # -wal-Daten beim GitHub-Actions-Cache-Save verloren gehen (jede Transaktion landet
+    # direkt in der .sqlite-Hauptdatei).
+    con.execute("PRAGMA journal_mode=DELETE")
     con.execute("PRAGMA busy_timeout=5000")
     init_db(con)
     return con
@@ -155,6 +160,39 @@ def init_db(con: sqlite3.Connection) -> None:
             UNIQUE(signal_id, horizon)
         );
 
+        -- Faithful Outcome-Label: löst die Exit-Regeln (TP/SL/Time-Stop/Expiry)
+        -- auf dem real empfohlenen Optionskontrakt auf. Quelle der Wahrheit fürs ML-Label.
+        CREATE TABLE IF NOT EXISTS trade_resolutions (
+            resolution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER NOT NULL,
+            run_id INTEGER,
+            ticker TEXT NOT NULL,
+            direction TEXT,
+            option_symbol TEXT,
+            expiration TEXT,
+            strike REAL,
+            opt_type TEXT,
+            entry_price REAL NOT NULL,
+            underlying_entry_price REAL,
+            tp_pct REAL,
+            sl_pct REAL,
+            time_stop_hours REAL,
+            time_stop_required_move_pct REAL,
+            opened_at TEXT NOT NULL,
+            last_mark REAL,
+            last_mark_at TEXT,
+            last_return_pct REAL,
+            marks_json TEXT,
+            status TEXT DEFAULT 'open',          -- open | resolved | expired_no_data
+            exit_reason TEXT,                    -- TP | SL | TIME_STOP | EXPIRY
+            exit_return_pct REAL,
+            is_win INTEGER,                      -- 1 | 0 | NULL
+            win_threshold_used TEXT,
+            resolved_at TEXT,
+            FOREIGN KEY(signal_id) REFERENCES signals(signal_id),
+            UNIQUE(signal_id)
+        );
+
         CREATE TABLE IF NOT EXISTS option_iv_history (
             iv_id INTEGER PRIMARY KEY AUTOINCREMENT,
             market_date TEXT NOT NULL,
@@ -176,6 +214,7 @@ def init_db(con: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_signals_ticker ON signals(ticker);
         CREATE INDEX IF NOT EXISTS idx_outcomes_due ON outcomes(status, due_at);
         CREATE INDEX IF NOT EXISTS idx_iv_history_ticker ON option_iv_history(ticker, created_at);
+        CREATE INDEX IF NOT EXISTS idx_resolutions_status ON trade_resolutions(status);
         """
     )
     _ensure_columns(con, "signals", {
@@ -216,6 +255,8 @@ def init_db(con: sqlite3.Connection) -> None:
         "time_stop_hours": "INTEGER",
         "time_stop_required_move_pct": "REAL",
         "time_stop_rule": "TEXT",
+        "ml_win_prob": "REAL",
+        "ml_model_version": "TEXT",
     })
     con.commit()
 
@@ -304,6 +345,7 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
         "iv_rank", "iv_percentile", "iv_history_count", "iv_rank_reason",
         "iv_cold_start", "sector_vs_market_pct", "sector_momentum_confirmation",
         "time_stop_hours", "time_stop_required_move_pct", "time_stop_rule",
+        "ml_win_prob", "ml_model_version",
     ]
     placeholders = ", ".join(["?"] * len(columns))
     sql = f"INSERT INTO signals({', '.join(columns)}) VALUES ({placeholders})"
@@ -348,11 +390,14 @@ def log_market_signals(run_id: int, parsed_signals: list[dict], market_data: lis
                 d.get("sector_vs_market_pct"), d.get("sector_momentum_confirmation", ""),
                 opt.get("time_stop_hours"), opt.get("time_stop_required_move_pct"),
                 opt.get("time_stop_rule", ""),
+                d.get("ml_win_prob"), d.get("ml_model_version"),
             ]
             cur = con.execute(sql, values)
             signal_id = int(cur.lastrowid)
             signal_ids.append((signal_id, d.get("price")))
-            _record_iv_snapshot(con, run_id, signal_id, ticker, d.get("news_direction") or ps.get("direction"), opt)
+            direction = d.get("news_direction") or ps.get("direction")
+            _record_iv_snapshot(con, run_id, signal_id, ticker, direction, opt)
+            _record_trade_resolution(con, run_id, signal_id, ticker, direction, d, opt, created)
 
         # Outcome-Zeitpunkte anlegen.
         for signal_id, start_price in signal_ids:
@@ -430,6 +475,44 @@ def _record_iv_snapshot(con: sqlite3.Connection, run_id: int, signal_id: int,
             (opt or {}).get("expiration"), strike, (opt or {}).get("dte_actual"), iv,
             (opt or {}).get("realized_vol_20d"), (opt or {}).get("iv_to_rv"),
             (opt or {}).get("option_source", "tradier"),
+        ),
+    )
+
+
+def _record_trade_resolution(con: sqlite3.Connection, run_id: int, signal_id: int,
+                             ticker: str, direction: str | None, d: dict, opt: dict,
+                             created: datetime) -> None:
+    """Legt eine offene Trade-Resolution an, sofern ein echter Optionskontrakt vorliegt.
+
+    Nur dann sinnvoll, wenn Tradier ein OCC-Symbol + Entry + Expiration geliefert hat;
+    sonst lässt sich das Outcome nicht auf Optionsebene auflösen.
+    """
+    opt = opt or {}
+    option_symbol = opt.get("option_symbol")
+    entry = _as_float(opt.get("conservative_entry"))
+    if entry is None:
+        entry = _as_float(opt.get("entry_price"))
+    if entry is None:
+        entry = _as_float(opt.get("midpoint"))
+    expiration = opt.get("expiration")
+    if not option_symbol or entry is None or entry <= 0 or not expiration:
+        return
+    opt_type = "call" if str(direction).upper() == "CALL" else "put"
+    con.execute(
+        """
+        INSERT OR IGNORE INTO trade_resolutions(
+            signal_id, run_id, ticker, direction, option_symbol, expiration, strike, opt_type,
+            entry_price, underlying_entry_price, tp_pct, sl_pct,
+            time_stop_hours, time_stop_required_move_pct, opened_at, status, marks_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]')
+        """,
+        (
+            signal_id, run_id, ticker, direction, option_symbol, expiration,
+            _as_float(opt.get("strike")), opt_type, entry, _as_float(d.get("price")),
+            RULES.exit_take_profit_pct, RULES.exit_stop_loss_pct,
+            _as_float(opt.get("time_stop_hours")),
+            _as_float(opt.get("time_stop_required_move_pct")),
+            iso(created),
         ),
     )
 
@@ -544,3 +627,160 @@ def update_due_outcomes(cfg: dict, max_updates: int = 50) -> int:
     if updated:
         logger.info("Journal: %d Outcomes aktualisiert", updated)
     return updated
+
+
+def _target_move_ok(direction: str | None, underlying_entry: float | None,
+                    underlying_now: float | None, required_move_pct: float | None) -> bool:
+    """True, wenn das Underlying mind. required_move_pct in Zielrichtung gelaufen ist."""
+    if not underlying_entry or underlying_entry <= 0 or underlying_now is None or required_move_pct is None:
+        return False
+    move = (underlying_now - underlying_entry) / underlying_entry * 100.0
+    if str(direction).upper() == "CALL":
+        return move >= required_move_pct
+    return move <= -required_move_pct
+
+
+def resolve_open_trades(cfg: dict, max_marks: int = 60) -> int:
+    """Aktualisiert offene Trade-Resolutions mit einem täglichen Options-Mark und löst
+    die Exit-Regeln (TP/SL/Time-Stop/Expiry) auf dem real empfohlenen Kontrakt auf.
+
+    Granularität: 1 Mark pro Bot-Lauf (i.d.R. täglich), forward-only. Intraday-Touches
+    von TP/SL können verpasst werden — bewusst konservativ (Hit erst bei Tages-Mark-Crossing).
+    Liefert die Anzahl in diesem Lauf final aufgelöster Trades.
+    """
+    con = connect()
+    rows = con.execute(
+        "SELECT * FROM trade_resolutions WHERE status = 'open' ORDER BY opened_at ASC LIMIT ?",
+        (max_marks,),
+    ).fetchall()
+    if not rows:
+        con.close()
+        return 0
+
+    try:
+        from market_data import get_option_quote, get_quote
+    except Exception as e:
+        logger.warning("Resolve ohne market_data nicht möglich: %s", e)
+        con.close()
+        return 0
+
+    token = cfg.get("tradier_token", "")
+    sandbox = bool(cfg.get("tradier_sandbox", False))
+    tp = RULES.exit_take_profit_pct
+    sl = RULES.exit_stop_loss_pct
+    threshold_label = f"exit_rules TP+{tp * 100:.0f}% SL-{sl * 100:.0f}% timestop"
+    now = utc_now()
+    underlying_cache: dict[str, float] = {}
+    resolved = 0
+    touched = 0
+
+    for r in rows:
+        entry = r["entry_price"]
+        if not entry or entry <= 0:
+            continue
+        direction = r["direction"]
+
+        try:
+            opened_at = datetime.fromisoformat(r["opened_at"])
+        except (TypeError, ValueError):
+            opened_at = now
+
+        expired = False
+        exp_str = r["expiration"]
+        if exp_str:
+            try:
+                if now.date() > datetime.strptime(exp_str, "%Y-%m-%d").date():
+                    expired = True
+            except ValueError:
+                pass
+
+        # Aktuellen Options-Mark holen (außer abgelaufen).
+        mark = None
+        if not expired:
+            q = get_option_quote(r["option_symbol"], token, sandbox)
+            if q and q.get("mid"):
+                mark = float(q["mid"])
+
+        # Ohne neuen Mark und nicht abgelaufen: offen lassen, nächster Lauf.
+        if mark is None and not expired:
+            continue
+
+        marks = []
+        if r["marks_json"]:
+            try:
+                marks = json.loads(r["marks_json"])
+            except (ValueError, TypeError):
+                marks = []
+
+        ret = r["last_return_pct"]
+        if mark is not None:
+            ret = round((mark - entry) / entry * 100.0, 3)
+            marks.append([iso(now), round(mark, 4), ret])
+
+        exit_reason = None
+        is_win = None
+        exit_ret = None
+
+        if ret is not None and mark is not None:
+            if ret >= tp * 100.0:
+                exit_reason, is_win, exit_ret = "TP", 1, ret
+            elif ret <= -sl * 100.0:
+                exit_reason, is_win, exit_ret = "SL", 0, ret
+            else:
+                tsh = r["time_stop_hours"]
+                elapsed_h = (now - opened_at).total_seconds() / 3600.0
+                if tsh and elapsed_h >= float(tsh):
+                    tkr = r["ticker"]
+                    if tkr not in underlying_cache:
+                        price, *_ = get_quote(tkr, cfg)
+                        underlying_cache[tkr] = price
+                    moved = _target_move_ok(direction, r["underlying_entry_price"],
+                                            underlying_cache.get(tkr),
+                                            r["time_stop_required_move_pct"])
+                    if not moved:
+                        exit_reason, exit_ret = "TIME_STOP", ret
+                        is_win = 1 if ret > 0 else 0
+
+        if expired and exit_reason is None:
+            final_ret = ret if ret is not None else r["last_return_pct"]
+            if final_ret is None:
+                con.execute(
+                    "UPDATE trade_resolutions SET status='expired_no_data', last_mark_at=?, "
+                    "marks_json=? WHERE resolution_id=?",
+                    (iso(now), _json(marks), r["resolution_id"]),
+                )
+                resolved += 1
+                continue
+            exit_reason, exit_ret = "EXPIRY", final_ret
+            is_win = 1 if final_ret > 0 else 0
+
+        if exit_reason:
+            con.execute(
+                """
+                UPDATE trade_resolutions
+                SET status='resolved', exit_reason=?, exit_return_pct=?, is_win=?,
+                    win_threshold_used=?, resolved_at=?, last_mark=?, last_mark_at=?,
+                    last_return_pct=?, marks_json=?
+                WHERE resolution_id=?
+                """,
+                (exit_reason, exit_ret, is_win, threshold_label, iso(now),
+                 mark if mark is not None else r["last_mark"], iso(now), ret,
+                 _json(marks), r["resolution_id"]),
+            )
+            resolved += 1
+        else:
+            con.execute(
+                """
+                UPDATE trade_resolutions
+                SET last_mark=?, last_mark_at=?, last_return_pct=?, marks_json=?
+                WHERE resolution_id=?
+                """,
+                (mark, iso(now), ret, _json(marks), r["resolution_id"]),
+            )
+            touched += 1
+
+    con.commit()
+    con.close()
+    if resolved or touched:
+        logger.info("Journal: %d Trades final aufgelöst, %d aktualisiert", resolved, touched)
+    return resolved

@@ -92,19 +92,31 @@ _FEED_HEADERS = {
 }
 
 # ==================== RSS FEEDS ====================
-RSS_FEEDS = [
-    # Hinweis: Reuters hat seine öffentlichen RSS-Feeds eingestellt -> entfernt (W5).
+# Stand 2026-06: live verifizierte Quellen. Entfernt wurden dauerhaft tote Feeds, die
+# bisher still scheiterten und den Run wertlos machten:
+#   - rss.cnbc.com (DNS/Connection-Fail vom Runner)
+#   - www.wsj.com (401 Bot-Block)
+#   - finance.yahoo.com/rss/headline (redirect -> 404)
+# Reuters hatte seine öffentlichen RSS-Feeds bereits eingestellt (W5).
+# NEU: SEC-EDGAR 8-K Atom-Feed = echte, handelbare Katalysatoren (8-K material events,
+# news_alpha=70 >= min_news_alpha) statt nur Pressemitteilungs-/Krypto-Rauschen.
+_DEFAULT_RSS_FEEDS = [
     "https://www.benzinga.com/feed",
-    "https://rss.cnbc.com/id/100003114",
-    "https://rss.cnbc.com/id/100727362",
     "https://feeds.bloomberg.com/markets/news.rss",
     "https://feeds.bloomberg.com/technology/news.rss",
-    "https://finance.yahoo.com/rss/headline",
+    "https://finance.yahoo.com/news/rssindex",
     "https://www.marketwatch.com/rss/topstories",
-    "https://www.wsj.com/xml/rss/3_7085.xml",
     "https://www.ft.com/rss/companies",
     "https://www.sec.gov/news/pressreleases.rss",
+    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom",
 ]
+
+# Operator-Override ohne Code-Änderung: NEWS_RSS_FEEDS="url1,url2,..."
+_FEEDS_ENV = os.environ.get("NEWS_RSS_FEEDS", "").strip()
+RSS_FEEDS = [u.strip() for u in _FEEDS_ENV.split(",") if u.strip()] or list(_DEFAULT_RSS_FEEDS)
+
+# Letzter Feed-Health-Status (von fetch_all_feeds gesetzt) — main.py liest das für die Telemetrie.
+LAST_FEED_HEALTH: dict = {"ok": 0, "failed": 0, "total": 0, "dead": []}
 
 # ==================== REGEX ====================
 _SEC_TITLE_RE = re.compile(
@@ -123,6 +135,59 @@ _TICKER_STOPWORDS = {
     "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL", "NEW", "CEO", "CFO",
     "USA", "GDP", "FED", "SEC", "ETF", "IPO", "AI", "IT", "ON", "OR", "SO", "GO",
     "BE", "AT", "AS", "IN", "OF", "TO", "IS", "BY", "UP", "WHO", "NOW", "OUT", "DAY",
+}
+
+# Echte, optionable Ticker, die aber zugleich gängige englische Wörter / Krypto-Namen /
+# Regulierungs-Akronyme sind. Bare Wortgrenzen-Matches darüber sind fast immer Fehl-
+# treffer (beobachtet: CAKE<-PancakeSwap, UNIT<-"unit", NMS<-"Regulation NMS",
+# POST<-"post", HELP). Diese Symbole zählen NUR via Cashtag ($CAKE) oder Wire-Exchange-
+# Prefix (NASDAQ:CAKE), nie über bloße Texterwähnung.
+_AMBIGUOUS_TICKERS = {
+    "POST", "CAKE", "UNIT", "NMS", "HELP", "ALL", "KEY", "ARE", "ICE", "GOLD",
+    "FAST", "OPEN", "WELL", "LOVE", "CARS", "PLAY", "FUN", "REAL", "NICE", "HOPE",
+    "SEE", "RUN", "PAY", "CASH", "SAFE", "BIG", "WIN", "GOOD", "BEST", "FREE",
+    "TON", "SUN", "FOR", "AN", "SO", "OR", "AT", "BY", "TV", "HE", "WE",
+}
+
+# Headlines, die strukturell KEINE handelbaren Equity-Katalysatoren sind:
+# Krypto-Preisprognosen / Coin-Spam und reine SEC-Verwaltungs-/Rulemaking-Meldungen.
+# Solche Artikel werden im Clustering komplett übersprungen (sie produzierten bislang
+# die Müll-Top-Cluster wie "Toncoin Price Prediction" -> POST).
+_NOISE_TITLE_RE = re.compile(
+    r"price\s+prediction|price\s+forecast|price\s+analysis|"
+    r"\b20(2[6-9]|3\d)\s*[-,]\s*20\d\d\b|"          # "...2026, 2027-2030" Prognose-Spam
+    r"will\s+\w+\s+(?:reach|hit|surge|explode)|"
+    r"seek(?:s)?\s+public\s+comment|request\s+for\s+comment|"
+    r"proposes?\s+(?:rescission|amendments?|rule)|proposed\s+rule|"
+    r"adopts?\s+amendments?|regulation\s+nms|"
+    r"appoints?\s+|names?\s+\w+\s+as\s+(?:director|chair|head)|"
+    r"office\s+of\s+investor",
+    re.IGNORECASE,
+)
+
+# Krypto-Coin-Namen, die in Klammer-Tickern ($BTC-Stil) auftauchen und nie US-Equities sind.
+_CRYPTO_NAMES_RE = re.compile(
+    r"\b(toncoin|pancakeswap|bitcoin|ethereum|dogecoin|solana|cardano|ripple|xrp|"
+    r"shiba|polkadot|avalanche|chainlink|litecoin|tron|polygon|uniswap)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_noise_headline(title: str, summary: str = "") -> bool:
+    """True, wenn die Headline kein handelbarer Equity-Katalysator ist (Krypto/SEC-Admin)."""
+    blob = f"{title} {summary}"
+    return bool(_NOISE_TITLE_RE.search(blob) or _CRYPTO_NAMES_RE.search(blob))
+
+
+# Generische englische Wörter, die im Firmennamen-Map als Kurz-Name auftauchen und
+# sonst fast jede Headline auf einen Zufalls-Ticker mappen (z. B. "news"->NWSA).
+_GENERIC_NAME_STOPWORDS = {
+    "news", "ball", "grab", "wise", "icon", "pool", "flex", "open", "real", "well",
+    "love", "play", "gold", "fast", "safe", "cash", "hope", "nice", "best", "good",
+    "free", "sun", "post", "cake", "unit", "help", "live", "care", "true", "time",
+    "work", "home", "food", "today", "world", "group", "market", "report", "global",
+    "daily", "street", "fun", "win", "big", "key", "all", "are", "ice", "see", "run",
+    "pay", "now", "new", "one", "way", "top", "buy", "sell",
 }
 
 # ==================== HELPERS ====================
@@ -164,9 +229,10 @@ def _fetch_feed_bytes(url: str, timeout: int = 12) -> bytes | None:
 
 
 def fetch_all_feeds() -> list[dict]:
-    """Parallel fetch aller RSS-Feeds."""
+    """Parallel fetch aller RSS-Feeds — mit Health-Tracking (tote Feeds werden laut)."""
     articles: list[dict] = []
     seen = set()
+    dead: list[str] = []
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(_fetch_feed_bytes, url): url for url in RSS_FEEDS}
@@ -174,6 +240,7 @@ def fetch_all_feeds() -> list[dict]:
             url = futures[fut]
             raw = fut.result()
             if not raw:
+                dead.append(url.split("//")[-1].split("/")[0])
                 continue
             try:
                 feed = feedparser.parse(raw)
@@ -198,7 +265,14 @@ def fetch_all_feeds() -> list[dict]:
             except Exception as e:
                 logger.debug("Parse error %s: %s", url, e)
 
-    logger.info("Fetched %d articles from %d feeds", len(articles), len(RSS_FEEDS))
+    total = len(RSS_FEEDS)
+    n_dead = len(dead)
+    LAST_FEED_HEALTH.update({"ok": total - n_dead, "failed": n_dead, "total": total, "dead": dead})
+    logger.info("Fetched %d articles from %d/%d feeds", len(articles), total - n_dead, total)
+    if n_dead:
+        # Tote Feeds nicht mehr still verschlucken — sie degradieren die Signalqualität.
+        level = logging.ERROR if n_dead > total // 2 else logging.WARNING
+        logger.log(level, "Feed-Health: %d/%d Feeds tot: %s", n_dead, total, ", ".join(dead))
     return articles
 
 
@@ -273,15 +347,29 @@ def _resolve_ticker_from_headline(title: str, summary: str = "") -> Optional[str
             return cand
 
     # 2) Wortgrenzen-Match, längste Ticker zuerst, deterministisch sortiert.
-    for t in sorted((x for x in known if len(x) >= 3 and x not in _TICKER_STOPWORDS),
+    #    Ambiguous-Ticker (gängige Wörter / Krypto / Akronyme) werden hier ausgeschlossen —
+    #    sie sind nur über den eindeutigen Cashtag oben erreichbar.
+    for t in sorted((x for x in known
+                     if len(x) >= 3 and x not in _TICKER_STOPWORDS and x not in _AMBIGUOUS_TICKERS),
                     key=lambda s: (-len(s), s)):
         if re.search(rf"\b{re.escape(t)}\b", text):
             return t
 
     # 3) Firmenname -> Ticker (längste Namen zuerst, um Teilstring-Kollisionen zu vermeiden).
+    #    Generische Wort-Namen (z. B. "news"->NWSA, "pool"->POOL) werden übersprungen, und
+    #    der Match ist wortgrenzen-gebunden — sonst triggert fast jede Headline einen
+    #    Zufalls-Ticker über ein Allerwelts-Wort.
     name_map = _load_name_to_ticker()
     for name, ticker in sorted(name_map.items(), key=lambda kv: -len(kv[0])):
-        if name and name.upper() in text:
+        if not name:
+            continue
+        nlow = name.lower()
+        if nlow in _GENERIC_NAME_STOPWORDS:
+            continue
+        if len(name) <= 5:
+            if re.search(rf"\b{re.escape(name.upper())}\b", text):
+                return ticker
+        elif name.upper() in text:
             return ticker
     return None
 
@@ -306,18 +394,32 @@ def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
                 conf = 7.5
 
         if not ticker:
+            # Plain-Headline-Pfad: zuerst strukturelles Rauschen (Krypto-Prognosen,
+            # SEC-Verwaltung) verwerfen, sonst entstehen Müll-Cluster wie POST/CAKE/NMS.
+            if _is_noise_headline(art["title"], art.get("summary", "")):
+                continue
             ticker = _resolve_ticker_from_headline(art["title"], art.get("summary", ""))
 
         if not ticker:
             continue
 
+        # Katalysator-Erkennung: echte Events heben Confidence + news_alpha über den
+        # news_standard-Floor (40), damit sie min_news_alpha (55) überhaupt erreichen können.
         lower_title = art["title"].lower()
         if any(x in lower_title for x in ["fda", "approval", "phase 3"]):
-            event_type = "fda_approval"
-            conf = 8.5
-        elif any(x in lower_title for x in ["merger", "acquisition", "buyout"]):
-            event_type = "merger"
-            conf = 8.2
+            event_type, conf = "fda_approval", 8.5
+        elif any(x in lower_title for x in ["merger", "acquisition", "buyout", "to acquire", "takeover"]):
+            event_type, conf = "merger", 8.2
+        elif any(x in lower_title for x in ["raises guidance", "guidance raise", "boosts outlook",
+                                            "raises outlook", "lifts guidance", "raises forecast"]):
+            event_type, conf = "guidance_raise", 7.8
+        elif any(x in lower_title for x in ["beats estimates", "tops estimates", "earnings beat",
+                                            "beats on", "tops forecasts"]):
+            event_type, conf = "earnings_beat", 7.2
+        elif any(x in lower_title for x in ["activist", "takes stake", "builds stake", "13d"]):
+            event_type, conf = "activist_entry", 7.5
+        elif any(x in lower_title for x in ["buyback", "share repurchase", "repurchase program"]):
+            event_type, conf = "buyback", 6.0
 
         if ticker not in ticker_signals or conf > ticker_signals[ticker]["confidence_score"]:
             ticker_signals[ticker] = {

@@ -11,11 +11,19 @@ eine HTML-Email mit konkreten Handelsempfehlungen.
 
 ```
 1. News-Analyse
-   ~10 RSS-Feeds (Bloomberg, CNBC, Benzinga, Yahoo, MarketWatch, WSJ, FT, SEC) parallel.
+   Live-verifizierte RSS-Feeds (Bloomberg, Benzinga, Yahoo, MarketWatch, FT,
+   SEC-Pressemitteilungen + SEC-EDGAR-8-K-Atom) parallel; tote Feeds werden via
+   Feed-Health-Check laut gemeldet statt still verschluckt.
+   Krypto-Preisprognosen, SEC-Verwaltungsmeldungen und Allerwelts-Wort-Ticker
+   (CAKE/UNIT/NMS/"news"…) werden herausgefiltert.
    Artikel werden je Ticker geclustert und nach Katalysator-Typ bewertet
-   (FDA, Merger, 8-K/13D/Form-4, Wire) → News-Alpha 0–100.
-   Claude wählt aus den Top-Clustern → handelbare Signale.
+   (FDA, Merger, Guidance, Earnings-Beat, 8-K/13D/Form-4, Wire) → News-Alpha 0–100.
+   Claude wählt aus den Top-Clustern; nur durch Cluster gedeckte Ticker zählen.
    (Earnings-Nähe ist KEIN Score-Bonus, sondern ein Risiko-Gate; siehe Schritt 2.)
+
+   Env-Overrides (optional): NEWS_RSS_FEEDS="url1,url2,…" überschreibt die Feed-Liste;
+   REQUIRE_MARKET_CONFIRMATION=0 schaltet das Gap/Volume-Bestätigungs-Gate ab
+   (evidenzbasiert kalibrieren — siehe Funnel-Telemetrie in der No-Trade-Mail).
 
 2. Marktdaten
    Kurse (AlphaVantage → Yahoo → Finnhub), historische Daten

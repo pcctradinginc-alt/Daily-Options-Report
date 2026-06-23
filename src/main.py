@@ -14,6 +14,7 @@ from config_loader import load_config, validate_config
 from news_analyzer import (
     fetch_all_feeds, build_earnings_map, cluster_articles,
     format_clusters_for_claude, run_claude, get_market_context,
+    LAST_FEED_HEALTH,
 )
 from market_data import (
     process_ticker, get_vix, get_earnings, build_summary,
@@ -39,8 +40,33 @@ logger = logging.getLogger(__name__)
 
 
 # ====================== HTML HELPER ======================
+def _funnel_html(funnel: dict | None) -> str:
+    """Kompakte Trichter-Telemetrie für die Mail: zeigt, an welcher Stufe der Run stirbt."""
+    if not funnel:
+        return ""
+    fh = funnel.get("feeds", {}) or {}
+    rows = [
+        ("Feeds ok", f'{fh.get("ok", "?")}/{fh.get("total", "?")}'
+                     + (f' (tot: {", ".join(fh.get("dead", []))})' if fh.get("dead") else "")),
+        ("Artikel", funnel.get("articles", "?")),
+        ("News-Cluster", funnel.get("clusters", "?")),
+        ("Claude-Signale", funnel.get("claude_signals", "?")),
+        ("nach Cluster-Check", funnel.get("after_cluster_validation", "?")),
+        ("Gate-cleared", funnel.get("gate_cleared", "?")),
+    ]
+    body = "".join(
+        f'<tr><td style="padding:4px 10px;color:#86868b;">{k}</td>'
+        f'<td style="padding:4px 10px;text-align:right;font-weight:600;">{v}</td></tr>'
+        for k, v in rows
+    )
+    return ('<div style="margin-top:22px;border-top:1px solid #e5e5ea;padding-top:14px;">'
+            '<div style="font-size:12px;color:#86868b;margin-bottom:6px;">Pipeline-Trichter</div>'
+            f'<table style="width:100%;font-size:13px;border-collapse:collapse;">{body}</table></div>')
+
+
 def _no_trade_html(today: str, vix=None, market_status: str = "",
-                   clusters: list = None, reason: str = "Kein valides Signal") -> str:
+                   clusters: list = None, reason: str = "Kein valides Signal",
+                   funnel: dict = None) -> str:
     vix_str = str(vix) if vix and vix != "n/v" else "n/v"
     status_str = market_status or "unbekannt"
     clusters = clusters or []
@@ -58,12 +84,14 @@ def _no_trade_html(today: str, vix=None, market_status: str = "",
                         f'<td style="padding:6px 8px;text-align:center;">{sent_icon}{src_badge}</td>' \
                         f'<td style="padding:6px 8px;color:#86868b;">{head}</td></tr>'
     cluster_section = f'<div style="margin-top:20px;">... {cluster_rows} ...</div>' if cluster_rows else ""
+    funnel_section = _funnel_html(funnel)
     return f'''<html><head><meta charset="UTF-8"></head><body style="background:#f5f5f7;">
     <div style="max-width:520px;margin:0 auto;padding:32px 16px;background:white;border-radius:18px;">
         <h2>Daily Options Report — {today}</h2>
         <h3 style="color:#ff3b30;">Heute kein Trade</h3>
         <p>VIX: {vix_str} | Grund: {reason}</p>
         {cluster_section}
+        {funnel_section}
     </div></body></html>'''
 
 
@@ -142,6 +170,17 @@ def main() -> int:
     earnings_map = build_earnings_map(cfg.get("finnhub_key", ""))
     clusters = cluster_articles(articles, earnings_map)
 
+    # Funnel-Telemetrie: zeigt am Ende (Log + Mail + Journal), an welcher Stufe der Run starb.
+    funnel = {
+        "feeds": dict(LAST_FEED_HEALTH),
+        "articles": len(articles),
+        "clusters": len(clusters),
+        "claude_signals": 0,
+        "after_cluster_validation": 0,
+        "gate_cleared": 0,
+        "selected": None,
+    }
+
     logger.info("Nach Ticker-Filterung: %d Cluster übrig (von %d Artikeln)", len(clusters), len(articles))
     if clusters:
         top = sorted(clusters, key=lambda c: c.get("confidence_score", 0), reverse=True)[:5]
@@ -169,9 +208,12 @@ def main() -> int:
     logger.info("Claude Signal: %s | VIX: %s", ticker_signals[:100], vix_value)
 
     if ticker_signals in ("TICKER_SIGNALS:NONE", "", None):
-        data = {"no_trade": True, "no_trade_grund": "Kein valides Signal", "vix": vix_value}
+        logger.info("Funnel: %s", funnel)
+        data = {"no_trade": True, "no_trade_grund": "Kein valides Signal", "vix": vix_value,
+                "funnel": funnel}
         journal.log_decision(data)
-        html = _no_trade_html(today, vix_value, market_status, clusters[:3], "Kein valides Signal")
+        html = _no_trade_html(today, vix_value, market_status, clusters[:3],
+                              "Kein valides Signal", funnel=funnel)
         _send_or_save(html, f"⏸️ Daily Options Report – Kein Trade – {today}", cfg, args.dry_run)
         return 0
 
@@ -182,6 +224,33 @@ def main() -> int:
     if not parsed_signals:
         logger.error("Keine gültigen Ticker geparst")
         return 1
+
+    funnel["claude_signals"] = len(parsed_signals)
+
+    # P1.4: Claude darf laut System-Prompt nur Ticker aus den gelieferten Clustern wählen.
+    # Jeder Cluster-Ticker trägt ein echtes news_alpha — Ticker OHNE Cluster kämen sonst mit
+    # news_alpha=0 an und würden still als "Weak News Alpha (0)" geblockt. Statt dieser
+    # intransparenten Selbst-Sabotage verwerfen wir Nicht-Cluster-Picks hier explizit.
+    cluster_tickers = {c.get("ticker") for c in clusters if c.get("ticker")}
+    if cluster_tickers:
+        kept = [s for s in parsed_signals if s["ticker"] in cluster_tickers]
+        dropped = [s["ticker"] for s in parsed_signals if s["ticker"] not in cluster_tickers]
+        if dropped:
+            logger.warning("P1.4: Claude-Ticker ohne News-Cluster verworfen: %s", dropped)
+        parsed_signals = kept
+
+    funnel["after_cluster_validation"] = len(parsed_signals)
+
+    if not parsed_signals:
+        grund = "Claude-Ticker nicht durch News-Cluster gedeckt"
+        logger.info("Deterministisch: %s", grund)
+        logger.info("Funnel: %s", funnel)
+        data = {"no_trade": True, "no_trade_grund": grund, "vix": vix_value, "funnel": funnel}
+        journal.log_decision(data)
+        html = _no_trade_html(today, vix=vix_value, market_status=market_status,
+                              clusters=clusters[:3], reason=grund, funnel=funnel)
+        _send_or_save(html, f"⏸️ Daily Options Report – Kein Trade – {today}", cfg, args.dry_run)
+        return 0
 
     ticker_directions = {s["ticker"]: s["direction"] for s in parsed_signals}
     tickers = list(ticker_directions.keys())
@@ -279,6 +348,22 @@ def main() -> int:
     cleared_tickers = [t for t, s in gate_status.items() if s["cleared"]]
     logger.info("Gate-cleared Ticker: %s", cleared_tickers or "keine")
 
+    # P2.7 Shadow-Dataset: für JEDEN geprüften Ticker das Gate-Ergebnis + bindenden Grund
+    # persistieren — auch an No-Trade-Tagen. So akkumuliert eine Basis, um evidenzbasiert zu
+    # sehen, WELCHES Gate wie oft blockt, statt Schwellen nach Bauchgefühl zu drehen.
+    shadow_gates = {
+        t: {"cleared": s["cleared"], "reason": s["reason"],
+            "conviction": s["conviction"], "ml_win_prob": s.get("ml_win_prob")}
+        for t, s in gate_status.items()
+    }
+    funnel["gate_cleared"] = len(cleared_tickers)
+    # häufigster Block-Grund (bindender Constraint) für die Telemetrie
+    block_reasons = [s["reason"] for s in gate_status.values() if not s["cleared"]]
+    if block_reasons:
+        from collections import Counter
+        funnel["top_block_reason"] = Counter(block_reasons).most_common(1)[0][0]
+    logger.info("Funnel: %s", funnel)
+
     journal.log_signals(parsed_signals, market_data, clusters)
 
     # STEP 3: Entscheidung DETERMINISTISCH (höchste Conviction unter gate-cleared), dann Report.
@@ -290,10 +375,14 @@ def main() -> int:
         if selected is None:
             # Kein Ticker hat alle Hard-Gates bestanden -> deterministischer No-Trade, kein LLM.
             grund = "Kein Ticker hat alle Hard-Gates bestanden"
+            if funnel.get("top_block_reason"):
+                grund += f" (häufigster Block: {funnel['top_block_reason']})"
             logger.info("Deterministisch: %s", grund)
-            data = {"no_trade": True, "no_trade_grund": grund, "vix": vix_value}
+            data = {"no_trade": True, "no_trade_grund": grund, "vix": vix_value,
+                    "funnel": funnel, "shadow_gates": shadow_gates}
             journal.log_decision(data)
-            html_report = _no_trade_html(today, vix=vix_value, clusters=clusters, reason=grund)
+            html_report = _no_trade_html(today, vix=vix_value, market_status=market_status,
+                                         clusters=clusters, reason=grund, funnel=funnel)
             _send_or_save(html_report, f"⏸️ No Trade – {today}", cfg, args.dry_run)
         else:
             sel_ticker = str(selected.get("ticker", "")).upper()
@@ -315,6 +404,9 @@ def main() -> int:
             # Prüfung fängt nur einen evtl. VIX-/Budget-No-Trade aus apply_vix_rules sauber ab.
             data = _enforce_gates_on_decision(data, gate_status)
 
+            funnel["selected"] = None if data.get("no_trade") else sel_ticker
+            data["funnel"] = funnel
+            data["shadow_gates"] = shadow_gates
             journal.log_decision(data)
             html_report = build_html(data, today)
             no_trade = data.get("no_trade", False)   # C1: Subject == Body

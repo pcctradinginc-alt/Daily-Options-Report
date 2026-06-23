@@ -10,8 +10,17 @@ v13 Rational-Gates + TradingRules Klasse:
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import Any
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Operator-Override per Env-Var (frozen-dataclass-kompatibel via default_factory)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 @dataclass(frozen=True)
 class TradingRules:
@@ -105,6 +114,12 @@ class TradingRules:
     min_price: float = 1.0                    # Keine Penny Stocks
     max_spread_pct: float = 8.0               # Max Spread (konservativ)
     min_news_alpha: int = 55                  # Mindest-Confidence aus news_analyzer
+    # Verlangt zusätzlich zum News-Katalysator eine Markt-Bestätigung (Gap+RVOL+Trend).
+    # Für eine reine News-Katalysator-Strategie ist das oft Doppel-Filterung; bewusst
+    # über Env (REQUIRE_MARKET_CONFIRMATION=0) abschaltbar gemacht — Default = bisheriges
+    # Verhalten —, damit es evidenzbasiert kalibriert statt blind im Code geändert wird.
+    require_market_confirmation: bool = field(
+        default_factory=lambda: _env_flag("REQUIRE_MARKET_CONFIRMATION", True))
 
     # === ML Outcome-Predictor (weiches Gate, überschreibt NIE harte Gates) ===
     ml_min_win_prob: float = 0.52             # Referenz/Report-Schwelle (kein hartes Gate mehr)
@@ -135,8 +150,10 @@ class TradingRules:
         if news_alpha < self.min_news_alpha:
             return False, f"Weak News Alpha ({news_alpha})"
 
-        # 3. Markt-Bestätigung Filter
-        if not market_metrics.get('is_confirmed', False) and not market_metrics.get('gap_volume_confirmed', False):
+        # 3. Markt-Bestätigung Filter (konfigurierbar — siehe require_market_confirmation)
+        if self.require_market_confirmation and \
+                not market_metrics.get('is_confirmed', False) and \
+                not market_metrics.get('gap_volume_confirmed', False):
             return False, "No Volume/Gap Confirmation"
 
         # 4. Spread Check

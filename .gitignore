@@ -17,6 +17,8 @@ data/*.sqlite-wal
 data/*.sqlite-shm
 data/ml_outcome_model.joblib
 data/ml_feature_names.json
+data/sec_company_tickers.json
+data/universe_cache.json
 # Test-/Coverage-Artefakte
 .coverage
 .coverage.*

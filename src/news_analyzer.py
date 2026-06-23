@@ -154,13 +154,15 @@ _AMBIGUOUS_TICKERS = {
 # Solche Artikel werden im Clustering komplett übersprungen (sie produzierten bislang
 # die Müll-Top-Cluster wie "Toncoin Price Prediction" -> POST).
 _NOISE_TITLE_RE = re.compile(
-    r"price\s+prediction|price\s+forecast|price\s+analysis|"
-    r"\b20(2[6-9]|3\d)\s*[-,]\s*20\d\d\b|"          # "...2026, 2027-2030" Prognose-Spam
-    r"will\s+\w+\s+(?:reach|hit|surge|explode)|"
+    r"price\s+prediction|price\s+forecast|price\s+target\s+202\d\s*[-,]|"
+    r"\bprice\s+analysis\b|"
+    # Krypto-Prognose-Spam: Jahres-Range NUR im Prognose-Kontext (nicht bei Guidance-News).
+    r"(?:prediction|forecast|outlook)\s+20\d\d\s*[-,]\s*20\d\d|"
     r"seek(?:s)?\s+public\s+comment|request\s+for\s+comment|"
     r"proposes?\s+(?:rescission|amendments?|rule)|proposed\s+rule|"
     r"adopts?\s+amendments?|regulation\s+nms|"
-    r"appoints?\s+|names?\s+\w+\s+as\s+(?:director|chair|head)|"
+    # Wortgrenzen, damit \bappoints\b nicht in "disappoints" (echter Katalysator) greift.
+    r"\bappoints?\b|\bnames?\b\s+\w+\s+as\s+(?:director|chair|head)|"
     r"office\s+of\s+investor",
     re.IGNORECASE,
 )
@@ -405,21 +407,24 @@ def cluster_articles(articles: List[Dict], earnings_map: Dict) -> List[Dict]:
 
         # Katalysator-Erkennung: echte Events heben Confidence + news_alpha über den
         # news_standard-Floor (40), damit sie min_news_alpha (55) überhaupt erreichen können.
-        lower_title = art["title"].lower()
-        if any(x in lower_title for x in ["fda", "approval", "phase 3"]):
-            event_type, conf = "fda_approval", 8.5
-        elif any(x in lower_title for x in ["merger", "acquisition", "buyout", "to acquire", "takeover"]):
-            event_type, conf = "merger", 8.2
-        elif any(x in lower_title for x in ["raises guidance", "guidance raise", "boosts outlook",
-                                            "raises outlook", "lifts guidance", "raises forecast"]):
-            event_type, conf = "guidance_raise", 7.8
-        elif any(x in lower_title for x in ["beats estimates", "tops estimates", "earnings beat",
-                                            "beats on", "tops forecasts"]):
-            event_type, conf = "earnings_beat", 7.2
-        elif any(x in lower_title for x in ["activist", "takes stake", "builds stake", "13d"]):
-            event_type, conf = "activist_entry", 7.5
-        elif any(x in lower_title for x in ["buyback", "share repurchase", "repurchase program"]):
-            event_type, conf = "buyback", 6.0
+        # NUR auf dem generischen News-Pfad — strukturierte Signale (SEC 8-K/13D, Wire)
+        # behalten ihre eigene (höhere) Einstufung und werden nie herabgestuft.
+        if event_type == "news_standard":
+            lower_title = art["title"].lower()
+            if any(x in lower_title for x in ["fda", "approval", "phase 3"]):
+                event_type, conf = "fda_approval", 8.5
+            elif any(x in lower_title for x in ["merger", "acquisition", "buyout", "to acquire", "takeover"]):
+                event_type, conf = "merger", 8.2
+            elif any(x in lower_title for x in ["raises guidance", "guidance raise", "boosts outlook",
+                                                "raises outlook", "lifts guidance", "raises forecast"]):
+                event_type, conf = "guidance_raise", 7.8
+            elif any(x in lower_title for x in ["beats estimates", "tops estimates", "earnings beat",
+                                                "beats on", "tops forecasts"]):
+                event_type, conf = "earnings_beat", 7.2
+            elif any(x in lower_title for x in ["activist", "takes stake", "builds stake", "13d"]):
+                event_type, conf = "activist_entry", 7.5
+            elif any(x in lower_title for x in ["buyback", "share repurchase", "repurchase program"]):
+                event_type, conf = "buyback", 6.0
 
         if ticker not in ticker_signals or conf > ticker_signals[ticker]["confidence_score"]:
             ticker_signals[ticker] = {

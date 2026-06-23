@@ -33,6 +33,16 @@ def test_noise_keeps_real_catalyst():
     assert not na._is_noise_headline("Pfizer raises guidance after strong Q2")
 
 
+def test_noise_does_not_overfilter_real_news():
+    # "disappoints" darf NICHT über \bappoints\b gefiltert werden (echter neg. Katalysator)
+    assert not na._is_noise_headline("Nvidia disappoints investors with soft outlook")
+    # Jahres-Range bei echter Guidance (nicht im Prognose-Kontext) bleibt erhalten
+    assert not na._is_noise_headline("Acme raises fiscal 2026, 2027 outlook after strong demand")
+    assert not na._is_noise_headline("Ford reaffirms 2026 guidance")
+    # Krypto-Prognose-Spam wird weiterhin gefiltert
+    assert na._is_noise_headline("XRP forecast 2026, 2027: where it goes next")
+
+
 # ----------------------------------------------------- Ambiguous-Ticker (Wort vs. Cashtag)
 def _set_universe(tickers):
     na._KNOWN_TICKERS_CACHE = set(tickers)

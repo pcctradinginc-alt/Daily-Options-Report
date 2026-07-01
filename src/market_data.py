@@ -512,6 +512,31 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
     ev_dollars = round(ev_points * 100.0, 2)
     ev_pct = round(ev_points / entry * 100.0, 2) if entry > 0 else -999.0
 
+    # ── Barriere-Geometrie (EXAKT, kein Modell) ───────────────────────────────
+    # Warum das zählt: Der Entry wird nahe Ask gefüllt (conservative_entry), der Exit
+    # (resolve_open_trades) rechnet am BID. Der volle Spread ist ein garantierter Round-Trip-
+    # Drag. Gemessen wird an einer Barriere (TP +50% / SL -30% auf dem Bid-Return), NICHT am
+    # 2-Tage-EV, auf den dieses Gate filtert. Diese Kennzahlen legen die Entkopplung offen:
+    #   round_trip_cost_pct  – Drag auf flachem Underlying (% des Entry), rein Spread.
+    #   tp_mid_gain_needed   – wie weit der FAIRE (Mid-)Optionswert steigen muss, damit ein
+    #                          Bid-Exit +TP bucht  (= TP% + Aufschlag aus Spread).
+    #   sl_mid_drop_trigger  – wie weit der faire Wert nur fallen muss, bis der Bid-Return -SL
+    #                          erreicht (Spread frisst die SL-Distanz an).
+    #   barrier_asymmetry    – tp_mid_gain_needed / sl_mid_drop_trigger. >1 ⇒ Gewinn braucht
+    #                          eine viel größere Bewegung als der Verlust — strukturell advers.
+    # Alles reine Algebra auf entry/mid/exit_slip; keine Greeks-Extrapolation → nicht irreführend.
+    tp = RULES.exit_take_profit_pct
+    sl = RULES.exit_stop_loss_pct
+    round_trip_cost_points = entry_slippage + exit_slip
+    round_trip_cost_pct = round(round_trip_cost_points / entry * 100.0, 2) if entry > 0 else None
+    if mid > 0:
+        tp_mid_gain_needed_pct = round(((1.0 + tp) * entry + exit_slip) / mid * 100.0 - 100.0, 2)
+        sl_mid_drop_trigger_pct = round(100.0 - ((1.0 - sl) * entry + exit_slip) / mid * 100.0, 2)
+        barrier_asymmetry = (round(tp_mid_gain_needed_pct / sl_mid_drop_trigger_pct, 2)
+                             if sl_mid_drop_trigger_pct and sl_mid_drop_trigger_pct > 0 else None)
+    else:
+        tp_mid_gain_needed_pct = sl_mid_drop_trigger_pct = barrier_asymmetry = None
+
     if direction == "CALL":
         breakeven_move_pct = ((strike + entry - underlying_price) / underlying_price * 100.0
                               if underlying_price > 0 else 999.0)
@@ -571,6 +596,10 @@ def evaluate_option_ev(option: dict, direction: str, underlying_price: float,
         "breakeven_move_pct": breakeven_move_pct,
         "entry_slippage_points": round(entry_slippage, 4),
         "exit_slippage_points": exit_slip,
+        "round_trip_cost_pct": round_trip_cost_pct,
+        "tp_mid_gain_needed_pct": tp_mid_gain_needed_pct,
+        "sl_mid_drop_trigger_pct": sl_mid_drop_trigger_pct,
+        "barrier_asymmetry": barrier_asymmetry,
         "ev_points": round(ev_points, 3),
         "ev_dollars": ev_dollars,
         "ev_pct": ev_pct,

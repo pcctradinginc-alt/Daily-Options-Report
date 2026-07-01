@@ -25,7 +25,7 @@ def _iso(dt: datetime) -> str:
 def _open_resolution(con, *, ticker="NVDA", direction="CALL", entry=1.00,
                      expiration="2099-12-31", opened_at=None, time_stop_hours=None,
                      required_move_pct=None, underlying_entry=100.0, last_return_pct=None,
-                     signal_id=1):
+                     signal_id=1, tp_pct=0.5, sl_pct=0.3):
     """Legt eine offene trade_resolution direkt an (umgeht die Live-Pipeline)."""
     opened = opened_at or _iso(datetime.now(timezone.utc))
     cur = con.execute(
@@ -35,11 +35,11 @@ def _open_resolution(con, *, ticker="NVDA", direction="CALL", entry=1.00,
             opt_type, entry_price, underlying_entry_price, tp_pct, sl_pct,
             time_stop_hours, time_stop_required_move_pct, opened_at, status,
             marks_json, last_return_pct
-        ) VALUES (?, 1, ?, ?, ?, ?, 100, ?, ?, ?, 0.5, 0.3, ?, ?, ?, 'open', '[]', ?)
+        ) VALUES (?, 1, ?, ?, ?, ?, 100, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '[]', ?)
         """,
         (signal_id, ticker, direction, f"{ticker}99C", expiration,
          "call" if direction == "CALL" else "put", entry, underlying_entry,
-         time_stop_hours, required_move_pct, opened, last_return_pct),
+         tp_pct, sl_pct, time_stop_hours, required_move_pct, opened, last_return_pct),
     )
     con.commit()
     return int(cur.lastrowid)
@@ -234,6 +234,28 @@ def test_take_profit_measured_at_bid(monkeypatch):
     con.close()
     assert row["exit_reason"] == "TP" and row["is_win"] == 1
     assert row["exit_return_pct"] >= tp * 100.0
+
+
+def test_resolve_honors_per_trade_thresholds(monkeypatch):
+    """HEBEL 3: resolve nutzt die PRO-TRADE gespeicherten tp_pct/sl_pct, nicht die globalen.
+
+    Ein Trade mit tp_pct=0.40 muss bei einem Bid-Return von +42 % als TP auflösen — mit den
+    globalen +50 % würde er offen bleiben. Beweist die Entkopplung von RULES.exit_*.
+    """
+    import trading_journal as tj
+    from rules import RULES
+    assert RULES.exit_take_profit_pct == 0.5  # Prämisse: global wäre strenger
+    con = tj.connect()
+    rid = _open_resolution(con, entry=1.00, tp_pct=0.40, sl_pct=0.35)
+    con.close()
+    _patch_quotes(monkeypatch, option_bid=1.42, option_ask=1.50, option_mid=1.46)
+
+    assert tj.resolve_open_trades({}) == 1
+    con = tj.connect()
+    row = con.execute("SELECT * FROM trade_resolutions WHERE resolution_id=?", (rid,)).fetchone()
+    con.close()
+    assert row["exit_reason"] == "TP" and row["is_win"] == 1
+    assert "TP+40%" in (row["win_threshold_used"] or "")
 
 
 def test_expiry_without_data_marks_no_data(monkeypatch):

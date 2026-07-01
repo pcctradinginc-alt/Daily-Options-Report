@@ -580,6 +580,14 @@ def _record_paper_order(con: sqlite3.Connection, run_id: int, signal_id: int,
                       (signal_id,)).fetchone()
     order_id = int(row[0]) if row else None
     opt_type = "call" if str(direction).upper() == "CALL" else "put"
+    # HEBEL 3: spread-aware Exit-Schwellen aus der Mikrostruktur zur Fill-Zeit. Der Exit rechnet
+    # am Bid, daher werden die intendierten Mid-Ziele (+50 %/-30 %) in Bid-Return-Schwellen
+    # übersetzt und PRO TRADE gespeichert. resolve_open_trades nutzt genau diese Werte.
+    bid = _as_float(opt.get("bid"))
+    ask = _as_float(opt.get("ask"))
+    mid = _as_float(opt.get("midpoint"))
+    half_spread = (ask - bid) / 2.0 if (bid is not None and ask is not None and ask >= bid) else 0.0
+    tp_pct, sl_pct = RULES.spread_adjusted_exit_thresholds(fill, mid, half_spread)
     con.execute(
         """
         INSERT OR IGNORE INTO trade_resolutions(
@@ -592,7 +600,7 @@ def _record_paper_order(con: sqlite3.Connection, run_id: int, signal_id: int,
         (
             signal_id, run_id, ticker, direction, option_symbol, expiration,
             _as_float(opt.get("strike")), opt_type, fill, _as_float(d.get("price")),
-            RULES.exit_take_profit_pct, RULES.exit_stop_loss_pct,
+            tp_pct, sl_pct,
             _as_float(opt.get("time_stop_hours")),
             _as_float(opt.get("time_stop_required_move_pct")),
             now_iso, order_id, order["quantity"], fill,
@@ -749,9 +757,6 @@ def resolve_open_trades(cfg: dict, max_marks: int = 60) -> int:
 
     token = cfg.get("tradier_token", "")
     sandbox = bool(cfg.get("tradier_sandbox", False))
-    tp = RULES.exit_take_profit_pct
-    sl = RULES.exit_stop_loss_pct
-    threshold_label = f"exit_rules TP+{tp * 100:.0f}% SL-{sl * 100:.0f}% timestop"
     now = utc_now()
     underlying_cache: dict[str, float] = {}
     resolved = 0
@@ -762,6 +767,14 @@ def resolve_open_trades(cfg: dict, max_marks: int = 60) -> int:
         if not entry or entry <= 0:
             continue
         direction = r["direction"]
+        # HEBEL 3: pro-Trade gespeicherte (spread-aware) Schwellen; Fallback auf globale, falls
+        # alte Zeilen ohne tp_pct/sl_pct existieren. Behebt zugleich, dass hier früher immer die
+        # globalen RULES-Schwellen genommen wurden, obwohl die Tabelle pro-Trade-Werte hält.
+        tp = _as_float(r["tp_pct"])
+        tp = tp if tp is not None else RULES.exit_take_profit_pct
+        sl = _as_float(r["sl_pct"])
+        sl = sl if sl is not None else RULES.exit_stop_loss_pct
+        threshold_label = f"exit_rules TP+{tp * 100:.0f}% SL-{sl * 100:.0f}% timestop"
 
         try:
             opened_at = datetime.fromisoformat(r["opened_at"])

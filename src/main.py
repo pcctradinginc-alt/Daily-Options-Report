@@ -178,6 +178,9 @@ def main() -> int:
         "claude_signals": 0,
         "after_cluster_validation": 0,
         "gate_cleared": 0,
+        # HEBEL 1 Shadow: Kandidaten, die der neue 5 %-Cap NEU ablehnt (Spread in [neu, alt)).
+        # Macht die Trichter-Kosten der Verschärfung sichtbar, bevor blind kalibriert wird.
+        "spread_band_new_rejects": 0,
         "selected": None,
     }
 
@@ -310,6 +313,11 @@ def main() -> int:
 
         passed, reason = RULES.evaluate_trade(ticker_info, d, news_alpha)
         hard_ok, hard_reason = _hard_gates_ok(d)
+        # HEBEL 1 Shadow: hätte der alte 8 %-Cap diesen Kandidaten (bzgl. Spread) durchgelassen,
+        # der neue 5 %-Cap aber nicht? Rein zählend, ändert die Entscheidung nicht.
+        sp = ticker_info.get("spread_pct")
+        if sp is not None and RULES.max_spread_pct < sp <= RULES.prev_max_spread_pct:
+            funnel["spread_band_new_rejects"] += 1
         score_ok = d.get("score", 0) >= RULES.min_score
         # ML wirkt NUR bei produktivem Modell: weicher Conviction-Boost + Hard-Block nur bei sehr
         # niedriger Wahrscheinlichkeit. Sonst inert (kein Boost, kein Gate).
@@ -333,12 +341,17 @@ def main() -> int:
 
         conviction = 0.0
         if cleared:
+            # HEBEL 2: weicher Malus für schlechte Payoff-Geometrie (barrier_asymmetry aus der
+            # Options-EV). Bevorzugt unter gleich starken Signalen die gewinnbarere Geometrie.
+            barrier_asym = (d.get("options") or {}).get("barrier_asymmetry")
+            barrier_penalty = RULES.barrier_conviction_penalty(barrier_asym)
             conviction = round(
                 news_alpha * RULES.conviction_news_weight
                 + d.get("score", 50) * RULES.conviction_score_weight
-                + conv_bonus, 2
+                + conv_bonus + barrier_penalty, 2
             )
-            logger.info("✅ Gate clear: %s | Conviction=%.1f | ML=%.0f%%", ticker, conviction, ml_prob * 100)
+            logger.info("✅ Gate clear: %s | Conviction=%.1f | ML=%.0f%% | BarrierAsym=%s (Malus %.1f)",
+                        ticker, conviction, ml_prob * 100, barrier_asym, barrier_penalty)
         else:
             logger.info("⛔ Gate block: %s | %s", ticker, block)
 

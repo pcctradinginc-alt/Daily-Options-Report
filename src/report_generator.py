@@ -699,6 +699,24 @@ def build_monthly_winrate_html(stats: dict) -> str:
                         row("Ø Return Gewinner", f'{overall.get("avg_win_ret","n/v")}%', G) +
                         row("Ø Return Verlierer", f'{overall.get("avg_loss_ret","n/v")}%', R, last=True))
 
+    # Struktureller Drag: legt offen, wie viel Bewegung der Trade ALLEIN wegen Near-Ask-Entry +
+    # Bid-Exit braucht (Spread), unabhängig von der Richtung. Erklärt "0 TP, alles TIME_STOP/SL".
+    structural_card = ""
+    if overall.get("structural_n"):
+        rtd = overall.get("round_trip_drag_pct")
+        asym = overall.get("barrier_asymmetry")
+        tpg = overall.get("tp_mid_gain_needed_pct")
+        structural_card = card(
+            "🧱", "#fdecea", "Strukturelle Payoff-Geometrie (Spread-Drag)",
+            row("Ø Round-Trip-Drag (flat)", "n/v" if rtd is None else f"−{rtd:.1f}%",
+                R if (rtd or 0) > 0 else GR) +
+            row("Ø Mid-Move für TP (+50%)", "n/v" if tpg is None else f"+{tpg:.1f}%", O) +
+            row("Ø Barriere-Asymmetrie (TP:SL)",
+                "n/v" if asym is None else f"{asym:.2f}×",
+                R if (asym or 0) >= 1.5 else O) +
+            row("Basis", f'aufgelöste Trades mit gespeicherter Geometrie (n={overall.get("structural_n",0)})',
+                GR, last=True))
+
     # ML-Impact.
     if not ml.get("available"):
         ml_inner = row("Status", "ML nicht verfügbar (sklearn/Modell fehlt)", GR, last=True)
@@ -777,7 +795,7 @@ def build_monthly_winrate_html(stats: dict) -> str:
             f'<h1 style="margin:0 0 4px 0;font-size:28px;font-weight:700;color:{DK};">'
             f'Monthly Win-Rate Report</h1>'
             f'<p style="margin:0;font-size:15px;color:{GR};">{month}</p></div>'
-            f'{notice}{overall_card}{paper_card}{ml_card}{breakdown}{fi_card}'
+            f'{notice}{overall_card}{structural_card}{paper_card}{ml_card}{breakdown}{fi_card}'
             f'<div style="text-align:center;padding:18px 0;border-top:1px solid {BD};margin-top:8px;">'
             f'<p style="margin:0;font-size:11px;color:{GR};">Label: echte Exit-Regeln (TP/SL/Time-Stop) '
             f'auf Optionsebene · forward-only</p></div></div></body></html>')

@@ -191,6 +191,41 @@ def _avg(values: list[float]) -> str:
     return f"{round(sum(values) / len(values), 2)}" if values else "n/v"
 
 
+def _structural_drag(rows: list[dict]) -> dict:
+    """Mittelt die zur Entscheidungszeit gespeicherte Barriere-Geometrie über aufgelöste Trades.
+
+    Zieht round_trip_cost_pct / barrier_asymmetry / tp_mid_gain_needed_pct aus dem option_json
+    jeder Zeile. Rein deskriptiv: zeigt, wie viel Struktur (Spread/Bid-Exit) im Ergebnis steckt.
+    """
+    import json
+
+    rt, asym, tp_need = [], [], []
+    for r in rows:
+        raw = r.get("option_json")
+        if not raw:
+            continue
+        try:
+            opt = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if opt.get("round_trip_cost_pct") is not None:
+            rt.append(float(opt["round_trip_cost_pct"]))
+        if opt.get("barrier_asymmetry") is not None:
+            asym.append(float(opt["barrier_asymmetry"]))
+        if opt.get("tp_mid_gain_needed_pct") is not None:
+            tp_need.append(float(opt["tp_mid_gain_needed_pct"]))
+
+    def _mean(xs):
+        return round(sum(xs) / len(xs), 2) if xs else None
+
+    return {
+        "n": len(rt),
+        "avg_round_trip_cost_pct": _mean(rt),
+        "avg_barrier_asymmetry": _mean(asym),
+        "avg_tp_mid_gain_needed_pct": _mean(tp_need),
+    }
+
+
 def compute_stats(cfg: dict) -> dict:
     """Aggregiert alle Kennzahlen aus dem Journal in das stats-Dict für den HTML-Report."""
     from trading_journal import connect
@@ -201,7 +236,7 @@ def compute_stats(cfg: dict) -> dict:
         """
         SELECT tr.is_win, tr.exit_reason, tr.exit_return_pct, tr.resolved_at,
                s.selected_trade, s.horizon, s.signal_strength, s.sector, s.ml_win_prob,
-               r.vix
+               s.option_json, r.vix
         FROM trade_resolutions tr
         JOIN signals s ON s.signal_id = tr.signal_id
         JOIN runs r ON r.run_id = s.run_id
@@ -229,6 +264,15 @@ def compute_stats(cfg: dict) -> dict:
                                     if not r["is_win"] and r["exit_return_pct"] is not None])
     rec_rows = [r for r in overall_rows if r["selected_trade"]]
     overall["recommended"] = rate_block(sum(int(r["is_win"]) for r in rec_rows), len(rec_rows))
+
+    # ── Struktureller Round-Trip-Drag (Bid-Exit vs Near-Ask-Entry) ────
+    # Legt offen, wie viel des Ergebnisses reine Spread-Struktur ist (nicht Richtung). Quelle:
+    # zur Entscheidungszeit gespeicherte EV-Felder im option_json. Reine Diagnose, kein Gate.
+    structural = _structural_drag(overall_rows)
+    overall["round_trip_drag_pct"] = structural["avg_round_trip_cost_pct"]
+    overall["barrier_asymmetry"] = structural["avg_barrier_asymmetry"]
+    overall["tp_mid_gain_needed_pct"] = structural["avg_tp_mid_gain_needed_pct"]
+    overall["structural_n"] = structural["n"]
 
     # ── ML-Impact (forward/OOS über live gespeicherte ml_win_prob) ────
     from ml_predictor import ML_AVAILABLE, OutcomePredictor

@@ -22,6 +22,17 @@ def _env_flag(name: str, default: bool) -> bool:
         return default
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
+
+def _env_float(name: str, default: float) -> float:
+    """Numerischer Operator-Override per Env-Var. Ungültig/fehlend -> Default."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip().replace(",", "."))
+    except (ValueError, AttributeError):
+        return default
+
 @dataclass(frozen=True)
 class TradingRules:
     # VIX-Grenzen
@@ -44,9 +55,12 @@ class TradingRules:
     require_tradier_quote_for_tradier_options: bool = True
     max_quote_age_seconds: int = 900
     # Liquidität / Ausführbarkeit
+    # max_spread_pct ist der EINE harte Retail-Spread-Block (weiter unten bei den Hard-Gates
+    # gesetzt, siehe dort). Hier bewusst NICHT erneut definieren — eine frühere Doppel-
+    # Definition (10.0 hier, 8.0 unten) war toter Code: die Dataclass behielt ohnehin nur
+    # den letzten Wert. Jetzt gibt es nur noch eine Quelle der Wahrheit.
     preferred_spread_pct: float = 5.0
     caution_spread_pct: float = 8.0
-    max_spread_pct: float = 10.0
     warn_spread_pct: float = 5.0
     wide_spread_min_ev_pct: float = 25.0
     wide_spread_min_ev_dollars: float = 35.0
@@ -102,17 +116,29 @@ class TradingRules:
     sector_confirms_score_bonus: float = 8.0
     sector_disagrees_score_malus: float = -12.0
     # Time-Stop-Plan
+    # HEBEL 4 (Time-Stops lockern): 3/5 der 0-Win-Trades starben am Time-Stop, weil der kurze
+    # 24h-Stop den Spread quasi sofort als Verlust bucht, bevor die These greifen kann. Multi-
+    # plikator gibt allen Fenstern mehr Raum (Default 1.5 = +50%). Tradeoff: mehr Theta-Bleed,
+    # wenn die Richtung falsch war. Env-tunebar (TIME_STOP_HOURS_MULT), Untergrenze 1.0.
     time_stop_target_move_pct: float = 1.0
     time_stop_short_dte_hours: int = 24
     time_stop_normal_dte_hours: int = 48
     time_stop_long_dte_hours: int = 72
+    time_stop_hours_mult: float = field(
+        default_factory=lambda: max(1.0, _env_float("TIME_STOP_HOURS_MULT", 1.5)))
     # Daily-RVOL
     daily_rvol_unusual_threshold: float = 1.5
 
     # === NEUE HARD GATES (aus deiner Anfrage) ===
     min_market_cap: int = 50_000_000          # 50M Minimum
     min_price: float = 1.0                    # Keine Penny Stocks
-    max_spread_pct: float = 8.0               # Max Spread (konservativ)
+    # HEBEL 1 (Spread-Disziplin 8->5): Der Round-Trip-Spread (Entry near-ask, Exit am Bid) ist
+    # ein garantierter Drag UND treibt die TP/SL-Barriere-Asymmetrie. 5 % attackiert beides an
+    # der Wurzel. RISIKO: kann den Trichter Richtung 0 Trades re-verstopfen — daher env-
+    # überschreibbar (MAX_SPREAD_PCT=8, um zum alten Verhalten zurückzukehren) + Shadow-Zählung
+    # der neu abgelehnten 5–8 %-Kandidaten in der Funnel-Telemetrie (main.py).
+    max_spread_pct: float = field(default_factory=lambda: _env_float("MAX_SPREAD_PCT", 5.0))
+    prev_max_spread_pct: float = 8.0          # Referenz für Shadow-Band-Zählung (alter Hard-Cap)
     min_news_alpha: int = 55                  # Mindest-Confidence aus news_analyzer
     # Verlangt zusätzlich zum News-Katalysator eine Markt-Bestätigung (Gap+RVOL+Trend).
     # Für eine reine News-Katalysator-Strategie ist das oft Doppel-Filterung; bewusst
@@ -131,6 +157,23 @@ class TradingRules:
     conviction_news_weight: float = 0.55      # Gewicht news_alpha (0-100) in der Conviction
     conviction_score_weight: float = 0.45     # Gewicht Markt-Score (0-100) in der Conviction
     account_value_usd: float = 250_000        # Referenz für calculate_position_size (%-Risk-Modus)
+
+    # === HEBEL 2 (Barriere-aware Selektion, WEICH) ===
+    # Unter gate-cleared Kandidaten die mit besserer Payoff-Geometrie bevorzugen: hohe
+    # barrier_asymmetry (TP-Move >> SL-Move) senkt die Conviction. NIE ein hartes Gate —
+    # nur ein Ranking-Tilt, ganz in der weichen ML-Linie. Ideal (Asymmetrie ~1) -> 0 Malus;
+    # ab ideal_asymmetry linear bis max_asymmetry auf -barrier_conviction_weight.
+    barrier_conviction_weight: float = 10.0   # max. Conviction-Malus aus schlechter Geometrie
+    barrier_ideal_asymmetry: float = 1.5      # bis hier kein Malus
+    barrier_max_asymmetry: float = 3.0        # ab hier voller Malus
+
+    # === HEBEL 3 (spread-aware Exits, forward-only) ===
+    # Übersetzt die INTENDIERTEN Fair-Value-Ziele (+50 % / -30 % auf dem Mid) in Bid-Return-
+    # Schwellen, weil der Exit am Bid rechnet. Ohne das triggert SL zu früh (~-22 % Mid) und TP
+    # ist unerreichbar (~+62 % Mid). Bounded + env-abschaltbar (SPREAD_AWARE_EXITS=0). Wirkt nur
+    # auf NEUE Trades (Resolutions sind forward-only) -> verzerrt keine bestehenden ML-Labels.
+    spread_aware_exits: bool = field(
+        default_factory=lambda: _env_flag("SPREAD_AWARE_EXITS", True))
 
     def evaluate_trade(self, ticker_info: dict, market_metrics: dict, news_alpha: float):
         """Das ultimative Filter-System (Hard Gates).
@@ -185,6 +228,45 @@ class TradingRules:
             risk_pct = max(0.005, min(0.06, risk_pct))
 
         return round(account_value * risk_pct, 2)
+
+    # ── Barriere-/Exit-Hilfen ─────────────────────────────────────────
+    def barrier_conviction_penalty(self, barrier_asymmetry: float | None) -> float:
+        """Weicher Conviction-Malus (<= 0) für schlechte Payoff-Geometrie (HEBEL 2).
+
+        Asymmetrie <= barrier_ideal_asymmetry -> 0. Linear bis barrier_max_asymmetry auf
+        -barrier_conviction_weight. Nie ein Gate; nur ein Ranking-Tilt.
+        """
+        if barrier_asymmetry is None:
+            return 0.0
+        try:
+            a = float(barrier_asymmetry)
+        except (TypeError, ValueError):
+            return 0.0
+        if a <= self.barrier_ideal_asymmetry:
+            return 0.0
+        span = max(1e-6, self.barrier_max_asymmetry - self.barrier_ideal_asymmetry)
+        frac = min(1.0, (a - self.barrier_ideal_asymmetry) / span)
+        return round(-self.barrier_conviction_weight * frac, 2)
+
+    def spread_adjusted_exit_thresholds(self, entry: float | None, mid: float | None,
+                                        half_spread: float | None) -> tuple[float, float]:
+        """Bid-Return-Schwellen (tp, sl als Beträge), die den INTENDIERTEN Mid-Moves
+        (+exit_take_profit_pct / -exit_stop_loss_pct) entsprechen (HEBEL 3).
+
+        Exit rechnet am Bid = mid_exit - half_spread. Bounded, damit kein Extremwert
+        durchschlägt: TP nie höher als nominal / nie < 20 %, SL nie enger als nominal / nie > 60 %.
+        Bei ausgeschaltetem Flag oder fehlenden Daten: nominale Schwellen.
+        """
+        tp = self.exit_take_profit_pct
+        sl = self.exit_stop_loss_pct
+        if (not self.spread_aware_exits or not entry or entry <= 0 or not mid or mid <= 0):
+            return tp, sl
+        hs = max(0.0, float(half_spread or 0.0))
+        tp_bid = ((1.0 + tp) * mid - hs) / entry - 1.0
+        sl_bid = 1.0 - ((1.0 - sl) * mid - hs) / entry
+        tp_bid = max(0.20, min(tp, tp_bid))
+        sl_bid = max(sl, min(0.60, sl_bid))
+        return round(tp_bid, 4), round(sl_bid, 4)
 
     # ── ML-Hilfen (weich) ─────────────────────────────────────────────
     def ml_conviction_bonus(self, ml_win_prob: float | None) -> float:
@@ -395,11 +477,13 @@ def build_time_stop_plan(direction: str, dte_actual: int | None) -> dict:
     except (TypeError, ValueError):
         dte = 0
     if dte <= 14:
-        hours = RULES.time_stop_short_dte_hours
+        base_hours = RULES.time_stop_short_dte_hours
     elif dte <= 30:
-        hours = RULES.time_stop_normal_dte_hours
+        base_hours = RULES.time_stop_normal_dte_hours
     else:
-        hours = RULES.time_stop_long_dte_hours
+        base_hours = RULES.time_stop_long_dte_hours
+    # HEBEL 4: Multiplikator gibt der These mehr Zeit, bevor der Spread als Verlust gebucht wird.
+    hours = int(round(base_hours * RULES.time_stop_hours_mult))
     sign = "+" if str(direction).upper() == "CALL" else "-"
     return {
         "time_stop_hours": hours,
